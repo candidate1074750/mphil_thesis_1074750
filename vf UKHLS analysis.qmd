@@ -1,0 +1,3341 @@
+---
+title: "2024.05.20 sensitive data analysis file"
+author: "candidate"
+format: html
+editor: visual
+---
+
+# 2024.05.27 sensitive data analysis file
+
+```{r setup, include=FALSE}
+
+knitr::opts_chunk$set(root.dir = "C:/Users/candidate/Downloads/UKHLS_analysis")
+
+```
+
+## Set up.
+
+```{r}
+
+# Clearing environment.
+rm(list=ls())
+
+# Confirming working directory.
+getwd()
+
+# Calling relevant packages.
+library(pacman)
+
+pacman::p_load(dplyr, AER, car, emmeans, fixest, fmsb, here, lattice, lme4, lmtest, 
+               marginaleffects, Matrix, modelsummary, nlstools, plm, tidyverse, estimatr, 
+               rdrobust, haven, labelled, dagitty, rddensity, knitr, kableExtra, stargazer, 
+               broom, eeptools, panelr, plm, zoo, MatchIt, twang, WeightIt, haven, dpm, 
+               ggplot2, nlme, MuMIn, RStata, readxl, glmnet, randomForest, DoubleML, mlr3, 
+               mlr3learners, mlr3tuning, data.table, sjlabelled, ranger, cem, rlang, purrr, data.table, optmatch, eeptools, tidyr, texreg, ggpubr)
+
+```
+
+```{r}
+
+# Load data. 
+load("ukhls.RData")
+isid(ukhls, vars = c("pidp", "wave"), verbose = FALSE)
+
+# Restricting to complete cases. Just lose 15 observations.
+ukhls <- ukhls %>%
+  filter(complete.cases(num_spells_unemployed, disp_inc, in_poverty, sexor_binary_2, age_dv, female, ed_degree, ed_hs, any_children, disabled, urban, married, immigrant, is_white))
+
+# Calculating the proportion of people who ever identified as LGB.
+
+summary(ukhls$sexor_binary_2)
+ukhls$sexor_binary_2[ukhls$sexor_det == 6] <- 1
+summary(ukhls$sexor_binary_2)
+
+# Identifying unique observations in the data set.
+unique_individuals <- ukhls %>%
+  distinct(pidp)
+
+# Creating a matrix containing two variables, xwavedid and ever_lgb. Calling it ever_matrix because I'm planning to add variables to the same matrix for a similar calculation about unemployment.
+ever_matrix <- ukhls %>%
+  arrange(pidp, wave) %>%  # Make sure the data is sorted by pidp and wave
+  group_by(pidp) %>%
+  mutate(spell_id = cumsum(c(1, diff(unemployed) != 0))) %>%
+  group_by(pidp, spell_id, add = TRUE) %>%
+  mutate(num_spells_unemployed = sum(unemployed)) %>%
+  ungroup() %>%
+  group_by(pidp) %>%
+  summarise(ever_lgb = max(ever_lgb, na.rm = TRUE),
+            ever_change_lgb = max(change_lgb, na.rm = T),
+            ever_change_lgb_2 = max(change_lgb_2, na.rm = T),
+            ever_unemployed = max(unemployed, na.rm = TRUE),
+            num_waves_unemployed = sum(unemployed, na.rm = TRUE),
+            num_spells_unemployed = max(num_spells_unemployed, na.rm = TRUE)) %>%
+  ungroup()
+
+identical(ever_matrix$num_spells_unemployed, ever_matrix$num_waves_unemployed) # Just confirming that num_spells_unemployed is indeed different than number of waves unemployed.
+
+# Dividing the number of people who've ever identified as LGB by the total number of people.
+proportion_ever_lgb <- mean(ever_matrix$ever_lgb == 1, na.rm = TRUE)
+proportion_ever_lgb
+
+# Calculating the proportion of people who ever CHANGED their LGB identification using sexor_det.
+proportion_ever_change_lgb <- mean(ever_matrix$ever_change_lgb == 1, na.rm = TRUE)
+proportion_ever_change_lgb
+
+# Calcuating the proportion of people who ever CHANGED their LGB identification using sexor_binary. These are people who moved into or out of identifying as LGB.
+proportion_ever_change_lgb_2 <- mean(ever_matrix$ever_change_lgb_2 == 1, na.rm = TRUE)
+proportion_ever_change_lgb_2
+
+setDT(ukhls)
+
+ukhls[, c("disp_inc_lag1", "disp_inc_lag2",
+          "num_spells_unemployed_lag1", "num_spells_unemployed_lag2",
+          "in_poverty_lag1", "in_poverty_lag2") := 
+        .(shift(disp_inc, 1L), shift(disp_inc, 2L),
+          shift(num_spells_unemployed, 1L), shift(num_spells_unemployed, 2L),
+          shift(in_poverty, 1L), shift(in_poverty, 2L)),
+      by = pidp]
+
+identical(ukhls$disp_inc_lag1, ukhls$disp_inc_lag2)
+
+summary(ukhls$sexor_det)
+ukhls <- ukhls %>%
+  mutate(q_man = ifelse(sexor_det %in% c(2, 4), 1, 0)) %>%
+  mutate(q_woman = ifelse(sexor_det %in% c(3, 5), 1, 0))
+summary(ukhls$q_man)
+summary(ukhls$q_woman)
+table(ukhls$sexor_det, ukhls$q_man)
+table(ukhls$sexor_det, ukhls$q_woman)
+
+summary(ukhls$sex_dv)
+ukhls <- ukhls %>%
+  mutate(q_man = ifelse(sexor_binary_2 == 1 & sex_dv == 1, 1, 0)) %>%
+  mutate(q_woman = ifelse(sexor_binary_2 == 1 & sex_dv == 2, 1, 0))
+
+ukhls$q_all[ukhls$q_man == 0 | ukhls$q_woman == 0] <- 0
+ukhls$q_all[ukhls$q_man == 1] <- 1
+ukhls$q_all[ukhls$q_woman == 1] <- 2
+
+table(ukhls$sexor_binary_2)
+table(ukhls$q_man)
+table(ukhls$q_woman)
+table(ukhls$q_all)
+
+```
+
+## 1: Variable selection.
+
+### 1.1: LASSO.
+
+```{r}
+
+# Employment.
+  
+# Making model matrix.
+X1.1e <- model.matrix(num_spells_unemployed ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + any_children + disabled + urban + married + immigrant + is_white, data = ukhls)
+Y1.1e <- ukhls$num_spells_unemployed
+# Excluding hhssos, coupled, fluent_english because of risk for multicollinearity. Will include if either hhsos, married, or mmigrant has coefficient very near 0 in absolute value.
+
+X1.1e <- model.matrix(num_spells_unemployed ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + disabled + urban + married + immigrant + is_white, data = ukhls)
+Y1.1e <- ukhls$num_spells_unemployed
+
+# Running lasso model.
+lasso1.1e <- cv.glmnet(X1.1e, Y1.1e, alpha = 1)
+coef(lasso1.1e, s = "lambda.min") 
+
+# Exclude: any_children.
+
+# Income.
+
+# Making model matrix.
+X1.1i <- model.matrix(disp_inc ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + any_children + disabled + urban + married + immigrant + is_white, data = ukhls)
+Y1.1i <- ukhls$disp_inc
+# Excluding hhssos, coupled, fluent_english because of risk for multicollinearity. Will include if either hhsos, married, or mmigrant has coefficient very near 0 in absolute value.
+
+# Running lasso model.
+lasso1.1i <- cv.glmnet(X1.1i, Y1.1i, alpha = 1)
+coef(lasso1.1i, s = "lambda.min") 
+
+# Exclude nothing.
+
+# Poverty.
+
+# Making model matrix.
+X1.1p <- model.matrix(in_poverty ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + any_children + disabled + urban + married + immigrant + is_white, data = ukhls)
+Y1.1p <- ukhls$in_poverty
+# Excluding hhssos, coupled, fluent_english because of risk for multicollinearity. Will include if either hhsos, married, or mmigrant has coefficient very near 0 in absolute value.
+
+X1.1p <- model.matrix(in_poverty ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + any_children + disabled + married + immigrant + is_white, data = ukhls)
+Y1.1p <- ukhls$in_poverty
+
+# Running lasso model.
+lasso1.1p <- cv.glmnet(X1.1p, Y1.1p, alpha = 1)
+coef(lasso1.1p, s = "lambda.min") 
+
+# Exclude: nothing.
+
+# Output!
+
+# Extract coefficients from the lasso models at the optimal lambda
+coef_unemployed <- as.matrix(coef(lasso1.1e, s = "lambda.min"))
+coef_income <- as.matrix(coef(lasso1.1i, s = "lambda.min"))
+coef_poverty <- as.matrix(coef(lasso1.1p, s = "lambda.min"))
+
+# Convert to data frames for easy manipulation and label the intercepts
+coef_unemployed <- data.frame(coefficient = rownames(coef_unemployed), estimate = coef_unemployed[, 1])
+coef_unemployed$coefficient[coef_unemployed$coefficient == "(Intercept)"] <- "Intercept_Unemployed"
+
+coef_income <- data.frame(coefficient = rownames(coef_income), estimate = coef_income[, 1])
+coef_income$coefficient[coef_income$coefficient == "(Intercept)"] <- "Intercept_Income"
+
+coef_poverty <- data.frame(coefficient = rownames(coef_poverty), estimate = coef_poverty[, 1])
+coef_poverty$coefficient[coef_poverty$coefficient == "(Intercept)"] <- "Intercept_Poverty"
+
+# Merge data frames to have a single table
+all_coefs <- merge(merge(coef_unemployed, coef_income, by = "coefficient", suffixes = c("_Unemployed", "_Income")), coef_poverty, by = "coefficient")
+names(all_coefs) <- c("Variable", "Unemployed", "Income", "Poverty")
+
+# Display the coefficients using stargazer in HTML format
+html_output <- stargazer(all_coefs, type = "html", summary = FALSE, rownames = FALSE, title = "UKHLS Lasso Results", out = "UKHLS_Lasso_Results.html")
+
+# Save the HTML output to a file
+cat(html_output, file = "UKHLS_lasso_results_labeled.html")
+
+```
+
+### 1.2: Elastic net.
+
+```{r}
+
+# Employment.
+
+# Model matrix.
+X1.2e <- model.matrix(num_spells_unemployed ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + any_children + disabled + urban + married + immigrant + is_white, data = ukhls)
+Y1.2e <- ukhls$num_spells_unemployed
+# Excluding hhssos, coupled, fluent_english because of risk for multicollinearity. Will include if either hhsos, married, or mmigrant has coefficient very near 0 in absolute value.
+
+# Running elastic net model.
+elastic_net1.2e <- cv.glmnet(X1.2e, Y1.2e, alpha = 0.5) # Alpha = 0.5 for Elastic Net
+
+# Get the coefficients
+coef(elastic_net1.2e, s = "lambda.min") 
+
+# Exclude: any_children.
+
+# Income.
+
+# Model matrix.
+X1.2i <- model.matrix(disp_inc ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + any_children + disabled + urban + married + immigrant + is_white, data = ukhls)
+Y1.2i <- ukhls$disp_inc
+# Excluding hhssos, coupled, fluent_english because of risk for multicollinearity. Will include if either hhsos, married, or mmigrant has coefficient very near 0 in absolute value.
+
+# Running elastic net model.
+elastic_net1.2i <- cv.glmnet(X1.2i, Y1.2i, alpha = 0.5) # Alpha = 0.5 for Elastic Net
+
+# Get the coefficients
+coef(elastic_net1.2i, s = "lambda.min") 
+
+# Exclude: nothing.
+
+# Poverty.
+
+# Model matrix.
+X1.2p <- model.matrix(in_poverty ~ sexor_binary_2 + age_dv + female + ed_degree + ed_hs + any_children + disabled + urban + married + immigrant + is_white, data = ukhls)
+Y1.2p <- ukhls$in_poverty
+# Excluding hhssos, coupled, fluent_english because of risk for multicollinearity. Will include if either hhsos, married, or mmigrant has coefficient very near 0 in absolute value.
+
+# Running elastic net model.
+elastic_net1.2p <- cv.glmnet(X1.2p, Y1.2p, alpha = 0.5) # Alpha = 0.5 for Elastic Net
+
+# Get the coefficients
+coef(elastic_net1.2p, s = "lambda.min")
+
+# Exclude: urban.
+
+# Output!
+
+# Extract coefficients at optimal lambda
+coef_unemployed <- as.matrix(coef(elastic_net1.2e, s = "lambda.min"))
+coef_income <- as.matrix(coef(elastic_net1.2i, s = "lambda.min"))
+coef_poverty <- as.matrix(coef(elastic_net1.2p, s = "lambda.min"))
+
+# Convert to data frames for easy manipulation and label the intercepts
+coef_unemployed <- data.frame(coefficient = rownames(coef_unemployed), estimate = coef_unemployed[, 1])
+coef_unemployed$coefficient[coef_unemployed$coefficient == "(Intercept)"] <- "Intercept_Unemployed"
+
+coef_income <- data.frame(coefficient = rownames(coef_income), estimate = coef_income[, 1])
+coef_income$coefficient[coef_income$coefficient == "(Intercept)"] <- "Intercept_Income"
+
+coef_poverty <- data.frame(coefficient = rownames(coef_poverty), estimate = coef_poverty[, 1])
+coef_poverty$coefficient[coef_poverty$coefficient == "(Intercept)"] <- "Intercept_Poverty"
+
+# Merge data frames to have a single table
+all_coefs <- merge(merge(coef_unemployed, coef_income, by = "coefficient", suffixes = c("_Unemployed", "_Income")), coef_poverty, by = "coefficient")
+names(all_coefs) <- c("Variable", "Unemployed", "Income", "Poverty")
+
+# Display the coefficients using stargazer in HTML format
+html_output <- stargazer(all_coefs, type = "html", summary = FALSE, rownames = FALSE, title = "UKHLS Elastic Net Results", out = "UKHLS_Elastic_Net_Results.html")
+
+# Save the HTML output to a file
+cat(html_output, file = "UKHLS_elastic_net_results.html")
+
+```
+
+### 1.3: Random forest.
+
+```{r}
+
+# Employment.
+
+ukhls_RFe <- ukhls %>%
+  select(wave, pidp, hidp, buno_dv, num_spells_unemployed, sexor_binary_2, age_dv, female, ed_degree, ed_hs, any_children, disabled, urban, married, immigrant, is_white)
+
+View(ukhls_RFe) # Confirming results.
+
+# Converting a couple variables to better formats for the RF.
+ukhls_RFe$buno_dv <- as_factor(ukhls_RFe$buno_dv)
+ukhls_RFe$pidp <- as.numeric(ukhls_RFe$pidp)
+str(ukhls_RFe$pidp)
+
+# Fit the random forest model
+rf_1.3e <- randomForest(num_spells_unemployed ~ ., data = ukhls_RFe, importance = TRUE, maxnodes = 100)
+
+# Print the variable importance measures
+rf_1.3e$importance
+
+# Plot the variable importance
+varImpPlot(rf_1.3e)
+
+# sexor_binary_2 and immigrant seem least important. any_children also not the most important.
+# Exclude: immigrant, probably.
+
+# Income.
+
+ukhls_RFi <- ukhls %>%
+  select(wave, pidp, hidp, buno_dv, disp_inc, sexor_binary_2, age_dv, female, ed_degree, ed_hs, any_children, disabled, urban, married, immigrant, is_white)
+
+View(ukhls_RFi) # Confirming results.
+
+# Converting a couple variables to better formats for the RF.
+ukhls_RFi$buno_dv <- as_factor(ukhls_RFi$buno_dv)
+ukhls_RFi$pidp <- as.numeric(ukhls_RFi$pidp)
+str(ukhls_RFi$pidp)
+
+# Fit the random forest model
+rf_1.3i <- randomForest(disp_inc ~ ., data = ukhls_RFi, importance = TRUE, maxnodes = 100)
+
+# Print the variable importance measures
+rf_1.3i$importance
+
+# Plot the variable importance
+varImpPlot(rf_1.3i)
+
+# Urban doesn't appear that important.
+# Exclude: urban, probably.
+
+# Poverty.
+ukhls_RFp <- ukhls %>%
+  select(wave, pidp, hidp, buno_dv, in_poverty, sexor_binary_2, age_dv, female, ed_degree, ed_hs, any_children, disabled, urban, married, immigrant, is_white)
+
+View(ukhls_RFp) # Confirming results.
+
+# Converting a couple variables to better formats for the RF.
+ukhls_RFp$buno_dv <- as_factor(ukhls_RFp$buno_dv)
+ukhls_RFp$pidp <- as.numeric(ukhls_RFp$pidp)
+str(ukhls_RFp$pidp)
+
+# Fit the random forest model
+rf_1.3p <- randomForest(in_poverty ~ ., data = ukhls_RFp, importance = TRUE, maxnodes = 100)
+
+# Print the variable importance measures
+rf_1.3p$importance
+
+# Plot the variable importance
+varImpPlot(rf_1.3p)
+
+# Exclude: urban and immigrant, probably!
+
+# Extract variable importance measures
+importance_poverty <- rf_1.3p$importance
+importance_employment <- rf_1.3e$importance
+importance_income <- rf_1.3i$importance
+
+# Convert to data frames for easy manipulation
+importance_poverty_df <- data.frame(Variable = rownames(importance_poverty), Importance_Poverty = importance_poverty[, 1])
+importance_employment_df <- data.frame(Variable = rownames(importance_employment), Importance_Employment = importance_employment[, 1])
+importance_income_df <- data.frame(Variable = rownames(importance_income), Importance_Income = importance_income[, 1])
+
+```
+
+### 1.4 Presenting variable selection.
+
+```{r}
+
+# Merge lasso, elastic net, and random forest coefficients for employment
+employment_coefs <- merge(merge(coef_unemployed, 
+                                 subset(coef_unemployed, select = c("coefficient", "estimate")),
+                                 by = "coefficient", suffixes = c("_Lasso", "_ElasticNet")),
+                           subset(importance_employment_df, select = c("Variable", "Importance_Employment")),
+                           by.x = "coefficient", by.y = "Variable", all = TRUE)
+names(employment_coefs) <- c("Variable", "Lasso", "ElasticNet", "RandomForest")
+
+# Display the employment coefficients using stargazer in HTML format
+html_output <- stargazer(employment_coefs, type = "html", summary = FALSE, rownames = FALSE, 
+                         title = "UKHLS Employment Coefficients: Lasso, Elastic Net, and Random Forest",
+                         out = "UKHLS_employment_coefficients.html")
+cat(html_output, file = "UKHLS_employment_coefficients.html")
+
+# Coefficient on hhsos is order of magnitude smaller than next smallest in lasso and EN. RF also suggests a small effect.
+
+# Merge lasso, elastic net, and random forest coefficients for income
+income_coefs <- merge(merge(coef_income, 
+                            subset(coef_income, select = c("coefficient", "estimate")),
+                            by = "coefficient", suffixes = c("_Lasso", "_ElasticNet")),
+                      subset(importance_income_df, select = c("Variable", "Importance_Income")),
+                      by.x = "coefficient", by.y = "Variable", all = TRUE)
+names(income_coefs) <- c("Variable", "Lasso", "ElasticNet", "RandomForest")
+
+# Display the income coefficients using stargazer in HTML format
+html_output <- stargazer(income_coefs, type = "html", summary = FALSE, rownames = FALSE, 
+                         title = "UKHLS Income Coefficients: Lasso, Elastic Net, and Random Forest",
+                         out = "UKHLS_income_coefficients.html")
+cat(html_output, file = "UKHLS_income_coefficients.html")
+
+# Exclude nothing.
+
+# Merge lasso, elastic net, and random forest coefficients for poverty status
+poverty_coefs <- merge(merge(coef_poverty, 
+                             subset(coef_poverty, select = c("coefficient", "estimate")),
+                             by = "coefficient", suffixes = c("_Lasso", "_ElasticNet")),
+                       subset(importance_poverty_df, select = c("Variable", "Importance_Poverty")),
+                       by.x = "coefficient", by.y = "Variable", all = TRUE)
+names(poverty_coefs) <- c("Variable", "Lasso", "ElasticNet", "RandomForest")
+
+# Display the poverty status coefficients using stargazer in HTML format
+html_output <- stargazer(poverty_coefs, type = "html", summary = FALSE, rownames = FALSE, 
+                         title = "UKHLS Poverty Status Coefficients: Lasso, Elastic Net, and Random Forest",
+                         out = "UKHLS_poverty_coefficients.html")
+cat(html_output, file = "UKHLS_poverty_coefficients.html")
+
+# Exclude urban/rural and immigrant.
+
+```
+
+## 2: Matching.
+
+### 2.1: Propensity score.
+
+```{r}
+
+# Can use the same matches for employment, income, and poverty.
+
+# Propensity score matching.
+ps_matches <- matchit(sexor_binary_2 ~ female + age_dv + is_white, data = ukhls, method = "nearest")
+
+# Checking propensity scores.
+summary(ps_matches)
+
+# Exracting matched dataset.
+ps_matches <- match.data(ps_matches)
+
+# Convert to panel data.
+ps_matches <- pdata.frame(ps_matches , index = c("pidp", "wave"))
+
+# 5,010 distinct people?
+n_distinct(ps_matches$pidp)
+
+```
+
+### 2.2: IPTW.
+
+```{r}
+
+# Step 1: Generate IPTW weights using the weightit function
+ipt_matches <- weightit(sexor_binary_2 ~ female + age_dv + is_white, data = ukhls, method = "ps", estimand = "ATE")
+
+# Step 2: Check IPTW scores
+summary(ipt_matches)
+
+# Step 3: Extract IPTW weights
+ipt_weights <- ipt_matches$weights
+
+# Step 4: Add IPTW weights to the ukhls dataset
+ukhls$ipt_weights <- ipt_weights
+summary(ukhls$ipt_weights)
+hist(ukhls$ipt_weights)
+
+# Step 5: Scale, normalize, trim, and re-normalize the weights
+# Scaling and normalizing
+sum_weights <- sum(ukhls$ipt_weights)
+ukhls$scaled_normalized_ipt_weights <- ukhls$ipt_weights / sum_weights * nrow(ukhls)
+summary(ukhls$scaled_normalized_ipt_weights)
+
+# Trimming the weights
+threshold <- quantile(ukhls$scaled_normalized_ipt_weights, 0.95)
+ukhls$trimmed_ipt_weights <- pmin(ukhls$scaled_normalized_ipt_weights, threshold)
+
+# Re-normalizing the weights
+ukhls$final_ipt_weights <- ukhls$trimmed_ipt_weights / sum(ukhls$trimmed_ipt_weights) * nrow(ukhls)
+summary(ukhls$final_ipt_weights)
+
+
+```
+
+## 3: Detailed descriptive statistics.
+
+```{r}
+
+avg_waves_unemployed <- ukhls %>%
+  group_by(pidp) %>%
+  filter(ever_unemployed == 1) %>%
+  pull(num_waves_unemployed) %>%
+  mean(na.rm = TRUE) 
+avg_waves_unemployed
+
+avg_spells_unemployed <- ukhls %>%
+  group_by(pidp) %>%
+  filter(num_spells_unemployed > 0) %>%
+  pull(num_spells_unemployed) %>%
+  mean(na.rm = TRUE)
+avg_spells_unemployed
+
+avg_waves_lgb <- ukhls %>%
+  group_by(pidp) %>%
+  filter(ever_lgb == 1) %>%
+  pull(num_waves_lgb_2) %>%
+  mean(na.rm = TRUE) 
+avg_waves_lgb
+
+ever_matrix <- ukhls %>%
+  arrange(pidp, wave) %>%  
+  group_by(pidp) %>%
+  mutate(spell_id = cumsum(c(1, diff(unemployed) != 0))) %>%
+  group_by(pidp, spell_id, add = TRUE) %>%
+  mutate(num_spells_unemployed = sum(unemployed)) %>%
+  ungroup() %>%
+  group_by(pidp) %>%
+  summarise(ever_lgb = max(ever_lgb, na.rm = TRUE),
+            ever_change_lgb = max(change_lgb, na.rm = T),
+            ever_change_lgb_2 = max(change_lgb_2, na.rm = T),
+            ever_unemployed = max(unemployed, na.rm = TRUE),
+            num_waves_unemployed = sum(unemployed, na.rm = TRUE),
+            num_spells_unemployed = max(num_spells_unemployed, na.rm = TRUE)) %>%
+  ungroup()
+
+identical(ever_matrix$num_spells_unemployed, ever_matrix$num_waves_unemployed) # Just confirming that num_spells_unemployed is indeed different than number of waves unemployed.
+
+# Dividing the number of people who've ever identified as LGB by the total number of people.
+proportion_ever_lgb <- mean(ever_matrix$ever_lgb == 1, na.rm = TRUE)
+proportion_ever_lgb
+
+# Calculating the proportion of people who ever CHANGED their LGB identification using sexor_det.
+ukhls$ever_change_lgb3 <- as.numeric(ave(ukhls$sexor_det, ukhls$pidp, FUN = function(x) length(unique(x[!is.na(x)])) > 1))
+
+summary(ukhls$ever_change_lgb3)
+
+proportion_ever_change_lgb <- mean(ever_matrix$ever_change_lgb == 1, na.rm = TRUE)
+proportion_ever_change_lgb
+
+# Calcuating the proportion of people who ever CHANGED their LGB identification using sexor_binary. These are people who moved into or out of identifying as LGB.
+proportion_ever_change_lgb_2 <- mean(ever_matrix$ever_change_lgb_2 == 1, na.rm = TRUE)
+proportion_ever_change_lgb_2
+
+```
+
+### 3.0 Formula and variable list
+
+```{r}
+
+# Function to calculate proportions, means, and conduct tests
+calc_stats <- function(data, var) {
+  if (is.numeric(data[[var]])) {
+    # Perform t-test for numeric variables
+    test_result <- t.test(data[[var]] ~ data$sexor_binary_2)
+    estimate <- data %>%
+      group_by(sexor_binary_2) %>%
+      summarize(
+        mean = mean(get(var), na.rm = TRUE),
+        std_error = sd(get(var), na.rm = TRUE) / sqrt(n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(mean, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = sexor_binary_2,
+        values_from = estimate_se,
+        names_glue = "{sexor_binary_2}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  } else {
+    # Perform proportion test for categorical variables
+    test_result <- prop.test(table(data[[var]], data$sexor_binary_2))
+    estimate <- data %>%
+      group_by(sexor_binary_2) %>%
+      summarize(
+        proportion = mean(get(var), na.rm = TRUE),
+        std_error = sqrt(proportion * (1 - proportion) / n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(proportion, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = sexor_binary_2,
+        values_from = estimate_se,
+        names_glue = "{sexor_binary_2}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  }
+  estimate %>%
+    mutate(
+      Significance = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    ) %>%
+    select(`0`, `1`, Significance) %>%
+    rename(`Non-LGB` = `0`, `LGB` = `1`)
+}
+
+# Calculate statistics for each variable
+variables <- c("female", "age_dv", "inc_unit_size", "any_children", "disabled", "immigrant", "ed_degree", "ed_hs", "urban", "married", "is_white", "unemployed", "ever_unemployed", "num_spells_unemployed", "disp_inc_untransformed", "in_poverty")
+variable_names <- c("Female", "Age", "Household size", "Any children", "Disabled", "Immigrant", "Post-secondary degree (at least)", "Secondary degree (at least)", "Live in urban area", "Married", "Is white", "Currently unemployed", "Ever unemployed", "Number spells unemployed", "Disposable income", "Experiencing poverty")
+
+ukhls$age_dv <- as_numeric(as_factor(ukhls$age_dv))
+summary(ukhls$age_dv)
+str(ukhls$inc_unit_size)
+str(ukhls$any_children)
+ukhls$disabled <- as_numeric(ukhls$disabled)
+str(ukhls$disabled)
+str(ukhls$immigrant)
+str(ukhls$ed_degree)
+str(ukhls$ed_hs)
+str(ukhls$urban)
+str(ukhls$married)
+str(ukhls$is_white)
+str(ukhls$unemployed)
+str(ukhls$ever_unemployed)
+str(ukhls$num_spells_unemployed)
+str(ukhls$disp_inc_untransformed)
+str(ukhls$in_poverty)
+
+options(digits = 4)
+
+```
+
+### 3.1 Unweighted, full sample.
+
+```{r}
+
+# Unweighted, full sample.
+stats_list <- lapply(1:length(variables), function(i) {
+  calc_stats(ukhls, variables[i]) %>% mutate(Variable = variable_names[i])
+})
+
+# Combine all statistics into one table
+stats_table <- bind_rows(stats_list) %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# Calculate sample size
+sample_size <- ukhls %>%
+  group_by(sexor_binary_2) %>%
+  summarize(count = n()) %>%
+  pivot_wider(names_from = sexor_binary_2, values_from = count) %>%
+  mutate(Variable = "Sample Size", `Non-LGB` = as.character(`0`), `LGB` = as.character(`1`), Significance = "") %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# Add sample size to the stats table
+stats_table <- bind_rows(stats_table, sample_size)
+
+# Combine rows with the same 'Variable' and 'Significance'
+combined_stats_table <- stats_table %>%
+  group_by(Variable, Significance) %>%
+  summarise(
+    `Non-LGB` = coalesce(first(`Non-LGB`), last(`Non-LGB`)),
+    `LGB` = coalesce(first(`LGB`), last(`LGB`))
+  ) %>%
+  ungroup() %>%
+  # Keep the order of rows and columns as specified
+  arrange(factor(Variable, levels = unique(stats_table$Variable))) %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# View the combined statistics table
+print(combined_stats_table)
+
+View(combined_stats_table)
+
+# Present the table using stargazer
+stargazer(
+  combined_stats_table,
+  type = "html",
+  out = "UKHLS_descriptive_stats.html",
+  summary = FALSE,
+  rownames = FALSE,
+  align = TRUE,
+  title = "UKHLS balance of characteristics between non-LGB and LGB People",
+  column.labels = c("Characteristics", "Non-LGB", "LGB", "Significance"),
+  digits = 4
+)
+
+```
+
+xx
+
+```{r}
+
+ukhls_men <- ukhls %>%
+  filter(sex_dv == 1)
+ukhls_women <- ukhls %>%
+  filter(sex_dv == 2)
+
+```
+
+xx
+
+```{r}
+
+# Function to calculate proportions, means, and conduct tests
+calc_stats <- function(data, var) {
+  if (is.numeric(data[[var]])) {
+    # Perform t-test for numeric variables
+    test_result <- t.test(data[[var]] ~ data$q_man)
+    estimate <- data %>%
+      group_by(q_man) %>%
+      summarize(
+        mean = mean(get(var), na.rm = TRUE),
+        std_error = sd(get(var), na.rm = TRUE) / sqrt(n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(mean, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = q_man,
+        values_from = estimate_se,
+        names_glue = "{q_man}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  } else {
+    # Perform proportion test for categorical variables
+    test_result <- prop.test(table(data[[var]], data$q_man))
+    estimate <- data %>%
+      group_by(q_man) %>%
+      summarize(
+        proportion = mean(get(var), na.rm = TRUE),
+        std_error = sqrt(proportion * (1 - proportion) / n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(proportion, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = q_man,
+        values_from = estimate_se,
+        names_glue = "{q_man}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  }
+  estimate %>%
+    mutate(
+      Significance = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    ) %>%
+    select(`0`, `1`, Significance) %>%
+    rename(`Non-GB Man` = `0`, `GB Man` = `1`)
+}
+
+# Calculate statistics for each variable
+variables <- c("age_dv", "inc_unit_size", "any_children", "disabled", "immigrant", "ed_degree", "ed_hs", "urban", "married", "is_white", "unemployed", "ever_unemployed", "num_spells_unemployed", "disp_inc_untransformed", "in_poverty")
+variable_names <- c("Age", "Household size", "Any children", "Disabled", "Immigrant", "Post-secondary degree (at least)", "Secondary degree (at least)", "Live in urban area", "Married", "Is white", "Currently unemployed", "Ever unemployed", "Number spells unemployed", "Disposable income", "Experiencing poverty")
+
+# Unweighted, full sample
+stats_list <- lapply(1:length(variables), function(i) {
+  calc_stats(ukhls_men, variables[i]) %>% mutate(Variable = variable_names[i])
+})
+
+# Combine all statistics into one table
+stats_table <- bind_rows(stats_list) %>%
+  select(Variable, `Non-GB Man`, `GB Man`, Significance)
+
+# Calculate sample size
+sample_size <- ukhls_men %>%
+  group_by(q_man) %>%
+  summarize(count = n()) %>%
+  pivot_wider(names_from = q_man, values_from = count) %>%
+  mutate(Variable = "Sample Size", `Non-GB Man` = as.character(`0`), `GB Man` = as.character(`1`), Significance = "") %>%
+  select(Variable, `Non-GB Man`, `GB Man`, Significance)
+
+# Add sample size to the stats table
+stats_table <- bind_rows(stats_table, sample_size)
+
+# Combine rows with the same 'Variable' and 'Significance'
+combined_stats_table <- stats_table %>%
+  group_by(Variable, Significance) %>%
+  summarise(
+    `Non-GB Man` = coalesce(first(`Non-GB Man`), last(`Non-GB Man`)),
+    `GB Man` = coalesce(first(`GB Man`), last(`GB Man`))
+  ) %>%
+  ungroup() %>%
+  # Keep the order of rows and columns as specified
+  arrange(factor(Variable, levels = unique(stats_table$Variable))) %>%
+  select(Variable, `Non-GB Man`, `GB Man`, Significance)
+
+# View the combined statistics table
+print(combined_stats_table)
+
+# Present the table using stargazer
+stargazer(
+  combined_stats_table,
+  type = "html",
+  out = "ukhls_men_descriptive_stats.html",
+  summary = FALSE,
+  rownames = FALSE,
+  align = TRUE,
+  title = "UKHLS descriptive statistics, men only, all waves",
+  column.labels = c("Characteristics", "Non-GB Man", "GB Man", ""),
+  digits = 4
+)
+
+```
+
+Women.
+
+```{r}
+
+# Function to calculate proportions, means, and conduct tests
+calc_stats <- function(data, var) {
+  if (is.numeric(data[[var]])) {
+    # Perform t-test for numeric variables
+    test_result <- t.test(data[[var]] ~ data$q_woman)
+    estimate <- data %>%
+      group_by(q_woman) %>%
+      summarize(
+        mean = mean(get(var), na.rm = TRUE),
+        std_error = sd(get(var), na.rm = TRUE) / sqrt(n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(mean, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = q_woman,
+        values_from = estimate_se,
+        names_glue = "{q_woman}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  } else {
+    # Perform proportion test for categorical variables
+    test_result <- prop.test(table(data[[var]], data$q_woman))
+    estimate <- data %>%
+      group_by(q_woman) %>%
+      summarize(
+        proportion = mean(get(var), na.rm = TRUE),
+        std_error = sqrt(proportion * (1 - proportion) / n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(proportion, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = q_woman,
+        values_from = estimate_se,
+        names_glue = "{q_woman}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  }
+  estimate %>%
+    mutate(
+      Significance = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    ) %>%
+    select(`0`, `1`, Significance) %>%
+    rename(`Non-LB Woman` = `0`, `LB Woman` = `1`)
+}
+
+# Calculate statistics for each variable
+variables <- c("age_dv", "inc_unit_size", "any_children", "disabled", "immigrant", "ed_degree", "ed_hs", "urban", "married", "is_white", "unemployed", "ever_unemployed", "num_spells_unemployed", "disp_inc_untransformed", "in_poverty")
+variable_names <- c("Age", "Household size", "Any children", "Disabled", "Immigrant", "Post-secondary degree (at least)", "Secondary degree (at least)", "Live in urban area", "Married", "Is white", "Currently unemployed", "Ever unemployed", "Number spells unemployed", "Disposable income", "Experiencing poverty")
+
+# Unweighted, full sample
+stats_list <- lapply(1:length(variables), function(i) {
+  calc_stats(ukhls_women, variables[i]) %>% mutate(Variable = variable_names[i])
+})
+
+# Combine all statistics into one table
+stats_table <- bind_rows(stats_list) %>%
+  select(Variable, `Non-LB Woman`, `LB Woman`, Significance)
+
+# Calculate sample size
+sample_size <- ukhls_women %>%
+  group_by(q_woman) %>%
+  summarize(count = n()) %>%
+  pivot_wider(names_from = q_woman, values_from = count) %>%
+  mutate(Variable = "Sample Size", `Non-LB Woman` = as.character(`0`), `LB Woman` = as.character(`1`), Significance = "") %>%
+  select(Variable, `Non-LB Woman`, `LB Woman`, Significance)
+
+# Add sample size to the stats table
+stats_table <- bind_rows(stats_table, sample_size)
+
+# Combine rows with the same 'Variable' and 'Significance'
+combined_stats_table <- stats_table %>%
+  group_by(Variable, Significance) %>%
+  summarise(
+    `Non-LB Woman` = coalesce(first(`Non-LB Woman`), last(`Non-LB Woman`)),
+    `LB Woman` = coalesce(first(`LB Woman`), last(`LB Woman`))
+  ) %>%
+  ungroup() %>%
+  # Keep the order of rows and columns as specified
+  arrange(factor(Variable, levels = unique(stats_table$Variable))) %>%
+  select(Variable, `Non-LB Woman`, `LB Woman`, Significance)
+
+# View the combined statistics table
+print(combined_stats_table)
+
+# Present the table using stargazer
+stargazer(
+  combined_stats_table,
+  type = "html",
+  out = "ukhls_women_descriptive_stats.html",
+  summary = FALSE,
+  rownames = FALSE,
+  align = TRUE,
+  title = "UKHLS descriptive statistics, women only, all waves",
+  column.labels = c("Characteristics", "Non-LB Woman", "LB Woman", ""),
+  digits = 4
+)
+
+```
+
+### 3.2 Unweighted, final wave.
+
+```{r}
+
+# Function to calculate proportions, means, and conduct tests
+calc_stats <- function(data, var) {
+  if (is.numeric(data[[var]])) {
+    # Perform t-test for numeric variables
+    test_result <- t.test(data[[var]] ~ data$sexor_binary_2)
+    estimate <- data %>%
+      group_by(sexor_binary_2) %>%
+      summarize(
+        mean = mean(get(var), na.rm = TRUE),
+        std_error = sd(get(var), na.rm = TRUE) / sqrt(n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(mean, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = sexor_binary_2,
+        values_from = estimate_se,
+        names_glue = "{sexor_binary_2}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  } else {
+    # Perform proportion test for categorical variables
+    test_result <- prop.test(table(data[[var]], data$sexor_binary_2))
+    estimate <- data %>%
+      group_by(sexor_binary_2) %>%
+      summarize(
+        proportion = mean(get(var), na.rm = TRUE),
+        std_error = sqrt(proportion * (1 - proportion) / n())
+      )
+    estimate <- estimate %>%
+      mutate(
+        estimate_se = paste0(round(proportion, 4), " (", round(std_error, 4), ")")
+      ) %>%
+      pivot_wider(
+        names_from = sexor_binary_2,
+        values_from = estimate_se,
+        names_glue = "{sexor_binary_2}"
+      ) %>%
+      mutate(
+        p_value = test_result$p.value
+      )
+  }
+  estimate %>%
+    mutate(
+      Significance = case_when(
+        p_value < 0.001 ~ "***",
+        p_value < 0.01 ~ "**",
+        p_value < 0.05 ~ "*",
+        TRUE ~ ""
+      )
+    ) %>%
+    select(`0`, `1`, Significance) %>%
+    rename(`Non-LGB` = `0`, `LGB` = `1`)
+}
+
+# Calculate statistics for each variable
+variables <- c("female", "age_dv", "inc_unit_size", "any_children", "disabled", "immigrant", "ed_degree", "ed_hs", "urban", "married", "is_white", "unemployed", "ever_unemployed", "num_spells_unemployed", "disp_inc_untransformed", "in_poverty")
+variable_names <- c("Female", "Age", "Household size", "Any children", "Disabled", "Immigrant", "Post-secondary degree (at least)", "Secondary degree (at least)", "Live in urban area", "Married", "Is white", "Currently unemployed", "Ever unemployed", "Number spells unemployed", "Disposable income", "Experiencing poverty")
+
+```
+
+```{r}
+
+# Unweighted, final wave.
+
+UKHLS_wave13 <- ukhls %>% filter(wave == 13)
+
+stats_list <- lapply(1:length(variables), function(i) {
+  calc_stats(UKHLS_wave13, variables[i]) %>% mutate(Variable = variable_names[i])
+})
+
+# Combine all statistics into one table
+stats_table <- bind_rows(stats_list) %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# Calculate sample size
+sample_size <- UKHLS_wave13 %>%
+  group_by(sexor_binary_2) %>%
+  summarize(count = n()) %>%
+  pivot_wider(names_from = sexor_binary_2, values_from = count) %>%
+  mutate(Variable = "Sample Size", `Non-LGB` = as.character(`0`), `LGB` = as.character(`1`), Significance = "") %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# Add sample size to the stats table
+stats_table <- bind_rows(stats_table, sample_size)
+
+# Combine rows with the same 'Variable' and 'Significance'
+combined_stats_table <- stats_table %>%
+  group_by(Variable, Significance) %>%
+  summarise(
+    `Non-LGB` = coalesce(first(`Non-LGB`), last(`Non-LGB`)),
+    `LGB` = coalesce(first(`LGB`), last(`LGB`))
+  ) %>%
+  ungroup() %>%
+  # Keep the order of rows and columns as specified
+  arrange(factor(Variable, levels = unique(stats_table$Variable))) %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# View the combined statistics table
+print(combined_stats_table)
+
+# Present the table using stargazer
+stargazer(
+  combined_stats_table,
+  type = "html",
+  out = "UKHLS_descriptive_stats_21.html",
+  summary = FALSE,
+  rownames = FALSE,
+  align = TRUE,
+  title = "UKHLS Balance of characteristics between non-LGB and LGB People, Wave 21",
+  column.labels = c("Characteristics", "Non-LGB", "LGB", "Significance"),
+  digits = 4
+)
+
+```
+
+### 3.3 P-score matched.
+
+```{r}
+
+# Propensity score matched.
+
+stats_list <- lapply(1:length(variables), function(i) {
+  calc_stats(ps_matches, variables[i]) %>% mutate(Variable = variable_names[i])
+})
+
+# Combine all statistics into one table
+stats_table <- bind_rows(stats_list) %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# Calculate sample size
+sample_size <- ps_matches %>%
+  group_by(sexor_binary_2) %>%
+  summarize(count = n()) %>%
+  pivot_wider(names_from = sexor_binary_2, values_from = count) %>%
+  mutate(Variable = "Sample Size", `Non-LGB` = as.character(`0`), `LGB` = as.character(`1`), Significance = "") %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# Add sample size to the stats table
+stats_table <- bind_rows(stats_table, sample_size)
+
+# Combine rows with the same 'Variable' and 'Significance'
+combined_stats_table <- stats_table %>%
+  group_by(Variable, Significance) %>%
+  summarise(
+    `Non-LGB` = coalesce(first(`Non-LGB`), last(`Non-LGB`)),
+    `LGB` = coalesce(first(`LGB`), last(`LGB`))
+  ) %>%
+  ungroup() %>%
+  # Keep the order of rows and columns as specified
+  arrange(factor(Variable, levels = unique(stats_table$Variable))) %>%
+  select(Variable, `Non-LGB`, `LGB`, Significance)
+
+# View the combined statistics table
+print(combined_stats_table)
+
+# Present the table using stargazer
+stargazer(
+  combined_stats_table,
+  type = "html",
+  out = "UKHLS_descriptive_stats_pscore.html",
+  summary = FALSE,
+  rownames = FALSE,
+  align = TRUE,
+  title = "UKHLS Balance of characteristics between non-LGB and LGB People, Propensity Score Matching",
+  column.labels = c("Characteristics", "Non-LGB", "LGB", "Significance"),
+  digits = 4
+)
+
+```
+
+### 3.4 DAGs.
+
+## 4: Employment.
+
+```{r}
+
+ukhls <- pdata.frame(ukhls, index = c("pidp", "wave"))
+
+```
+
+### 4.1: Pooled, between, fixed, and random effects.
+
+#### 4.1.1: Regular.
+
+```{r}
+
+# Pooling.
+plm4.1p <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 + sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm4.1p)
+
+# Between.
+plm4.1b <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm4.1b)
+
+# Fixed.
+plm4.1f <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm4.1f)
+
+# Random.
+plm4.1r <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm4.1r)
+
+# Hausman test.
+hausman4.1 <- phtest(plm4.1f, plm4.1r)
+hausman4.1 # Shouldn't use random.
+
+# Employment: pooled, between, fixed, and random effects.
+stargazer(plm4.1p, plm4.1b, plm4.1f, plm4.1r,
+          type = "html",
+          out = "employment411.html",
+          title = "UKHLS Employment: pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm4.1pM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 + q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm4.1pM)
+
+# Between.
+plm4.1bM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm4.1bM)
+
+# Fixed.
+plm4.1fM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm4.1fM)
+
+# Random.
+plm4.1rM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm4.1rM)
+
+# Hausman test.
+hausman4.1M <- phtest(plm4.1fM, plm4.1rM)
+hausman4.1M # Shouldn't use random.
+
+# Employment: pooled, between, fixed, and random effects.
+stargazer(plm4.1pM, plm4.1bM, plm4.1fM, plm4.1rM,
+          type = "html",
+          out = "employment411M.html",
+          title = "UKHLS Employment: pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm4.1pF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 + q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm4.1pF)
+
+# Between.
+plm4.1bF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm4.1bF)
+
+# Fixed.
+plm4.1fF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm4.1fF)
+
+# Random.
+plm4.1rF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm4.1rF)
+
+# Hausman test.
+hausman4.1F <- phtest(plm4.1fF, plm4.1rF)
+hausman4.1F # Shouldn't use random.
+
+# Employment: pooled, between, fixed, and random effects.
+stargazer(plm4.1pF, plm4.1bF, plm4.1fF, plm4.1rF,
+          type = "html",
+          out = "employment411F.html",
+          title = "UKHLS Employment: pooled, between, fixed, and random effects, females",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+library(texreg)
+
+# Combine models for all sexes, male, and female
+htmlreg(list(plm4.1p, plm4.1b, plm4.1f, plm4.1r,
+             plm4.1pM, plm4.1bM, plm4.1fM, plm4.1rM,
+             plm4.1pF, plm4.1bF, plm4.1fF, plm4.1rF),
+        file = "employment_combined_plm41_ukhls.html",
+        title = "UKHLS Employment: Pooled, Between, Fixed, and Random Effects Models",
+        caption = "UKHLS Employment: Pooled, Between, Fixed, and Random Effects Models",
+        caption.above = TRUE,
+        label = "tab:employment_combined_plm41_ukhls",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("num_spells_unemployed_lag1" = "Unemployment Spells (Lag 1)",
+                               "num_spells_unemployed_lag2" = "Unemployment Spells (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+```
+
+#### 4.1.2: PS matched.
+
+```{r}
+
+# Pooling.
+plm4.1ps_p <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm4.1ps_p)
+
+# Between.
+plm4.1ps_b <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm4.1ps_b)
+
+# Fixed.
+plm4.1ps_f <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm4.1ps_f)
+
+# Random.
+plm4.1ps_r <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm4.1ps_r)
+
+# Hausman test.
+hausman4.1_ps <- phtest(plm4.1ps_f, plm4.1ps_r)
+hausman4.1_ps # Shouldn't use random.
+
+# PS matched: pooled, between, fixed, and random effects.
+stargazer(plm4.1ps_p, plm4.1ps_b, plm4.1ps_f, plm4.1ps_r,
+          type = "html",
+          out = "employment412.html",
+          title = "UKHLS Employment: propensity score matched pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm4.1pMs_p <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm4.1pMs_p)
+
+# Between.
+plm4.1pMs_b <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm4.1pMs_b)
+
+# Fixed.
+plm4.1pMs_f <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm4.1pMs_f)
+
+# Random.
+plm4.1pMs_r <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm4.1pMs_r)
+
+# Hausman test.
+hausman4.1M_ps <- phtest(plm4.1pMs_f, plm4.1pMs_r)
+hausman4.1M_ps # Shouldn't use random.
+
+# PS matched: pooled, between, fixed, and random effects.
+stargazer(plm4.1pMs_p, plm4.1pMs_b, plm4.1pMs_f, plm4.1pMs_r,
+          type = "html",
+          out = "employment412M.html",
+          title = "UKHLS Employment: propensity score matched pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm4.1pFs_p <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm4.1pFs_p)
+
+# Between.
+plm4.1pFs_b <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm4.1pFs_b)
+
+# Fixed.
+plm4.1pFs_f <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm4.1pFs_f)
+
+# Random.
+plm4.1pFs_r <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm4.1pFs_r)
+
+# Hausman test.
+hausman4.1F_ps <- phtest(plm4.1pFs_f, plm4.1pFs_r)
+hausman4.1F_ps # Shouldn't use random.
+
+# PS matched: pooled, between, fixed, and random effects.
+stargazer(plm4.1pFs_p, plm4.1pFs_b, plm4.1pFs_f, plm4.1pFs_r,
+          type = "html",
+          out = "employment412F.html",
+          title = "UKHLS Employment: propensity score matched pooled, between, fixed, and random effects, females",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+#### 4.1.3: IPT weighted.
+
+```{r}
+
+# Pooling.
+plm4.1ipt_p <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm4.1ipt_p)
+
+# Between.
+plm4.1ipt_b <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm4.1ipt_b)
+
+# Fixed.
+plm4.1ipt_f <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm4.1ipt_f)
+
+# Random.
+plm4.1ipt_r <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm4.1ipt_r)
+
+# Hausman test.
+hausman4.1_ipt <- phtest(plm4.1ipt_f, plm4.1ipt_r)
+hausman4.1_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm4.1ipt_p, plm4.1ipt_b, plm4.1ipt_f, plm4.1ipt_r,
+          type = "html",
+          out = "employment413.html",
+          title = "UKHLS Employment: propensity score matched pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm4.1ipt_pM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm4.1ipt_pM)
+
+# Between.
+plm4.1ipt_bM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm4.1ipt_bM)
+
+# Fixed.
+plm4.1ipt_fM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm4.1ipt_fM)
+
+# Random.
+plm4.1ipt_rM <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm4.1ipt_rM)
+
+# Hausman test.
+hausman4.1M_ipt <- phtest(plm4.1ipt_fM, plm4.1ipt_rM)
+hausman4.1M_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm4.1ipt_pM, plm4.1ipt_bM, plm4.1ipt_fM, plm4.1ipt_rM,
+          type = "html",
+          out = "employment413M.html",
+          title = "UKHLS Employment: propensity score matched pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm4.1ipt_pF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm4.1ipt_pF)
+
+# Between.
+plm4.1ipt_bF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm4.1ipt_bF)
+
+# Fixed.
+plm4.1ipt_fF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm4.1ipt_fF)
+
+# Random.
+plm4.1ipt_rF <- plm(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm4.1ipt_rF)
+
+# Hausman test.
+hausman4.1F_ipt <- phtest(plm4.1ipt_fF, plm4.1ipt_rF)
+hausman4.1F_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm4.1ipt_pF, plm4.1ipt_bF, plm4.1ipt_fF, plm4.1ipt_rF,
+          type = "html",
+          out = "employment413F.html",
+          title = "UKHLS Employment: propensity score matched pooled, between, fixed, and random effects, females",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+library(texreg)
+
+# Combine models for all sexes, male, and female
+htmlreg(list(plm4.1ipt_p, plm4.1ipt_b, plm4.1ipt_f, plm4.1ipt_r,
+             plm4.1ipt_pM, plm4.1ipt_bM, plm4.1ipt_fM, plm4.1ipt_rM,
+             plm4.1ipt_pF, plm4.1ipt_bF, plm4.1ipt_fF, plm4.1ipt_rF),
+        file = "employment_combined_plm41_ukhls_ipt.html",
+        title = "UKHLS Employment: Propensity Score Matched Pooled, Between, Fixed, and Random Effects Models",
+        caption = "UKHLS Employment: Pooled, Between, Fixed, and Random Effects Models, IPT Weighted",
+        caption.above = TRUE,
+        label = "tab:employment_combined_plm41_ukhls_ipt",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("num_spells_unemployed_lag1" = "Unemployment Spells (Lag 1)",
+                               "num_spells_unemployed_lag2" = "Unemployment Spells (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+```
+
+### 4.2: Random effects w/ varying slopes.
+
+#### 4.2.1: Regular
+
+```{r}
+
+View(ukhls)
+# Random.
+plm4.2r <- lmer(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 + sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled + married + immigrant + (1 + sexor_binary_2 | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm4.2r) # Model fit isn't great.
+
+r_sq_plm4.2r <- r.squaredGLMM(plm4.2r) # R-squared for the whole model is very high.
+r_sq_plm4.2r
+
+```
+
+##### Men.
+
+```{r}
+
+# Random.
+plm4.2rM <- lmer(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 + q_man + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_man | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm4.2rM) # Model fit isn't great.
+
+r_sq_plm4.2rM <- r.squaredGLMM(plm4.2rM) # R-squared for the whole model is very high.
+
+```
+
+##### Women.
+
+```{r}
+
+# Random.
+plm4.2rF <- lmer(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 + q_woman + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_woman | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm4.2rF) # Model fit isn't great.
+
+r_sq_plm4.2rF <- r.squaredGLMM(plm4.2rF) # R-squared for the whole model is very high.
+
+
+```
+
+#### 4.2.2: IPT weighted
+
+```{r}
+
+# Random.
+plm4.2ipt_r <- lmer(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled + married + immigrant + (1 + sexor_binary_2 | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm4.2ipt_r) # Model fit isn't great.
+
+r_sq_plm4.2ipt_r <- r.squaredGLMM(plm4.2ipt_r) # R-squared for the whole model is very high.
+r_sq_plm4.2ipt_r
+
+# Extract the predicted values and residuals from the model
+pred_values <- predict(plm4.2ipt_r)
+residuals <- residuals(plm4.2ipt_r)
+
+ukhls_complete <- na.omit(ukhls$num_spells_unemployed_lag2)
+
+# Create a data frame with the actual values, predicted values, and residuals
+plot_data <- data.frame(
+  Actual = ukhls_complete$num_spells_unemployed,
+  Predicted = pred_values,
+  Residual = residuals
+)
+
+# Create the plot
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point() +
+  geom_abline(intercept = 0, slope = 1, color = "red") +
+  labs(title = "Actual vs. Predicted Values",
+       x = "Actual Number of Unemployment Spells",
+       y = "Predicted Number of Unemployment Spells") +
+  theme_minimal()
+
+```
+
+##### Men.
+
+```{r}
+
+# Random.
+plm4.2ipt_rM <- lmer(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_man + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_man | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm4.2ipt_rM) # Model fit isn't great.
+
+r_sq_plm4.2ipt_rM <- r.squaredGLMM(plm4.2ipt_rM) # R-squared for the whole model is very high.
+r_sq_plm4.2ipt_rM
+
+```
+
+##### Women.
+
+```{r}
+
+# Random.
+plm4.2ipt_rF <- lmer(num_spells_unemployed ~ num_spells_unemployed_lag1 + num_spells_unemployed_lag2 +q_woman + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_woman | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm4.2ipt_rF) # Model fit isn't great.
+
+r_sq_plm4.2ipt_rF <- r.squaredGLMM(plm4.2ipt_rF) # R-squared for the whole model is very high.
+r_sq_plm4.2ipt_rF
+
+# Combine models for all sexes, male, and female
+htmlreg(list(plm4.2r, plm4.2rM, plm4.2rF,
+             plm4.2ipt_r, plm4.2ipt_rM, plm4.2ipt_rF),
+        file = "employment_combined_plm42.html",
+        title = "UKHLS Employment: Random Effects Models",
+        caption = "UKHLS Employment: Linear Mixed Effects Models",
+        caption.above = TRUE,
+        label = "tab:employment_combined_plm42",
+        custom.model.names = c("Random", "Random (M)", "Random (F)",
+                               "Random (IPT)", "Random (IPT, M)", "Random (IPT, F)"),
+        custom.coef.map = list("num_spells_unemployed_lag1" = "Unemployment Spells (Lag 1)",
+                               "num_spells_unemployed_lag2" = "Unemployment Spells (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "hgage" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "helth" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"),
+        include.aic = TRUE,
+        include.bic = TRUE,
+        include.nobs = TRUE,
+        include.rsquared = TRUE,
+        include.adjrs = TRUE,
+        single.row = TRUE,
+        stars = c(0.01, 0.05, 0.1),
+        omit.coef = c("(Intercept)", "Num. groups: hidp", "Num. groups: pidp",
+                      "Var: hidp (Intercept)", "Var: pidp (Intercept)",
+                      "Var: pidp sexor_binary_2", "Cov: pidp (Intercept) sexor_binary_2",
+                      "Var: Residual", "Var: pidp q_man", "Cov: pidp (Intercept) q_man",
+                      "Var: pidp q_woman", "Cov: pidp (Intercept) q_woman"))
+
+
+```
+
+### 4.3: MBAW MLE.
+
+```{r}
+
+# In Stata.
+
+```
+
+### 4.4: DML for CI.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLe <- ukhls %>%
+  select(num_spells_unemployed, num_spells_unemployed_lag1, num_spells_unemployed_lag2, sexor_binary_2, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLe <- as.data.table(UKHLS_DMLe)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLe$buno_dv <- as_factor(UKHLS_DMLe$buno_dv)
+UKHLS_DMLe$age_dv <- as_numeric(as_factor(UKHLS_DMLe$age_dv))
+str(UKHLS_DMLe$buno_dv)
+str(UKHLS_DMLe$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1e <- "num_spells_unemployed"
+treatment1e <- "sexor_binary_2"
+covars1e <- setdiff(names(UKHLS_DMLe), c("pidp", "wave", outcome1e, treatment1e))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_e <- DoubleMLData$new(UKHLS_DMLe, y_col = outcome1e, d_cols = treatment1e, x_cols = covars1e)
+
+# Fitting the DML model.
+learner1e = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1e = DoubleMLPLR$new(UKHLS_DMLobj_e, ml_l = learner1e, ml_m = learner1e)
+
+dml_plr1e$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1e = dml_plr1e$coef
+theta_hat1e
+
+# Get the standard error and confidence intervals
+se_hat1e = dml_plr1e$se
+se_hat1e 
+
+# Does seem to be causal effect of being LGB on employment spells!
+
+```
+
+##### Men.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLeM <- ukhls %>%
+  select(num_spells_unemployed, num_spells_unemployed_lag1, num_spells_unemployed_lag2, q_man, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLeM <- as.data.table(UKHLS_DMLeM)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLeM$buno_dv <- as_factor(UKHLS_DMLeM$buno_dv)
+UKHLS_DMLeM$age_dv <- as_numeric(as_factor(UKHLS_DMLeM$age_dv))
+str(UKHLS_DMLeM$buno_dv)
+str(UKHLS_DMLeM$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1e <- "num_spells_unemployed"
+treatment1e <- "q_man"
+covars1e <- setdiff(names(UKHLS_DMLeM), c("pidp", "wave", outcome1e, treatment1e))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_e <- DoubleMLData$new(UKHLS_DMLeM, y_col = outcome1e, d_cols = treatment1e, x_cols = covars1e)
+
+# Fitting the DML model.
+learner1e = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1eM = DoubleMLPLR$new(UKHLS_DMLobj_e, ml_l = learner1e, ml_m = learner1e)
+
+dml_plr1eM$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1eM = dml_plr1eM$coef
+theta_hat1eM
+
+# Get the standard error and confidence intervals
+se_hat1eM = dml_plr1eM$se
+se_hat1eM 
+
+# Does seem to be causal effect of being LGB on employment spells!
+
+```
+
+##### Women.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLeF <- ukhls %>%
+  select(num_spells_unemployed, num_spells_unemployed_lag1, num_spells_unemployed_lag2, q_woman, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLeF <- as.data.table(UKHLS_DMLeF)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLeF$buno_dv <- as_factor(UKHLS_DMLeF$buno_dv)
+UKHLS_DMLeF$age_dv <- as_numeric(as_factor(UKHLS_DMLeF$age_dv))
+str(UKHLS_DMLeF$buno_dv)
+str(UKHLS_DMLeF$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1e <- "num_spells_unemployed"
+treatment1e <- "q_woman"
+covars1e <- setdiff(names(UKHLS_DMLeF), c("pidp", "wave", outcome1e, treatment1e))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_e <- DoubleMLData$new(UKHLS_DMLeF, y_col = outcome1e, d_cols = treatment1e, x_cols = covars1e)
+
+# Fitting the DML model.
+learner1e = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1eF = DoubleMLPLR$new(UKHLS_DMLobj_e, ml_l = learner1e, ml_m = learner1e)
+
+dml_plr1eF$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1eF = dml_plr1eF$coef
+theta_hat1eF
+
+# Get the standard error and confidence intervals
+se_hat1eF = dml_plr1eF$se
+se_hat1eF 
+
+# Does seem to be causal effect of being LGB on employment spells!
+
+```
+
+## 5: Income.
+
+### 5.1: Pooled, between, fixed, and random effects.
+
+#### 5.1.1: Regular.
+
+```{r}
+
+# Pooling.
+plm5.1p <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 + sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm5.1p)
+
+# Between.
+plm5.1b <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm5.1b)
+
+# Fixed.
+plm5.1f <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm5.1f)
+
+# Random.
+plm5.1r <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm5.1r)
+
+# Hausman test.
+hausman5.1 <- phtest(plm5.1f, plm5.1r)
+hausman5.1 # Shouldn't use random.
+
+# income: pooled, between, fixed, and random effects.
+stargazer(plm5.1p, plm5.1b, plm5.1f, plm5.1r,
+          type = "html",
+          out = "income511.html",
+          title = "UKHLS income: pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm5.1pM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 + q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm5.1pM)
+
+# Between.
+plm5.1bM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm5.1bM)
+
+# Fixed.
+plm5.1fM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm5.1fM)
+
+# Random.
+plm5.1rM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm5.1rM)
+
+# Hausman test.
+hausman5.1M <- phtest(plm5.1fM, plm5.1rM)
+hausman5.1M # Shouldn't use random.
+
+# income: pooled, between, fixed, and random effects.
+stargazer(plm5.1pM, plm5.1bM, plm5.1fM, plm5.1rM,
+          type = "html",
+          out = "income511M.html",
+          title = "UKHLS income: pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm5.1pF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 + q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm5.1pF)
+
+# Between.
+plm5.1bF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm5.1bF)
+
+# Fixed.
+plm5.1fF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm5.1fF)
+
+# Random.
+plm5.1rF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm5.1rF)
+
+# Hausman test.
+hausman5.1F <- phtest(plm5.1fF, plm5.1rF)
+hausman5.1F # Shouldn't use random.
+
+# income: pooled, between, fixed, and random effects.
+stargazer(plm5.1pF, plm5.1bF, plm5.1fF, plm5.1rF,
+          type = "html",
+          out = "income511F.html",
+          title = "UKHLS income: pooled, between, fixed, and random effects, females",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+# Install and load the htmlreg package
+# install.packages("htmlreg")
+library(htmlreg)
+
+# Combine models for all sexes, male, and female
+htmlreg(list(plm5.1p, plm5.1b, plm5.1f, plm5.1r,
+             plm5.1pM, plm5.1bM, plm5.1fM, plm5.1rM,
+             plm5.1pF, plm5.1bF, plm5.1fF, plm5.1rF),
+        file = "income_combined_plm51_ukhls.html",
+        title = "UKHLS Income: Pooled, Between, Fixed, and Random Effects Models",
+        caption = "UKHLS Income: Pooled, Between, Fixed, and Random Effects Models",
+        caption.above = TRUE,
+        label = "tab:income_combined_plm51_ukhls",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("disp_inc_lag1" = "Disposable Income (Lag 1)",
+                               "disp_inc_lag2" = "Disposable Income (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+```
+
+#### 5.1.2: PS matched.
+
+```{r}
+
+# Pooling.
+plm5.1ps_p <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm5.1ps_p)
+
+# Between.
+plm5.1ps_b <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm5.1ps_b)
+
+# Fixed.
+plm5.1ps_f <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm5.1ps_f)
+
+# Random.
+plm5.1ps_r <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm5.1ps_r)
+
+# Hausman test.
+hausman5.1_ps <- phtest(plm5.1ps_f, plm5.1ps_r)
+hausman5.1_ps # Shouldn't use random.
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm5.1pMs_p <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm5.1pMs_p)
+
+# Between.
+plm5.1pMs_b <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm5.1pMs_b)
+
+# Fixed.
+plm5.1pMs_f <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm5.1pMs_f)
+
+# Random.
+plm5.1pMs_r <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm5.1pMs_r)
+
+# Hausman test.
+hausman5.1M_ps <- phtest(plm5.1pMs_f, plm5.1pMs_r)
+hausman5.1M_ps # Shouldn't use random.
+
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm5.1pFs_p <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm5.1pFs_p)
+
+# Between.
+plm5.1pFs_b <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm5.1pFs_b)
+
+# Fixed.
+plm5.1pFs_f <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm5.1pFs_f)
+
+# Random.
+plm5.1pFs_r <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm5.1pFs_r)
+
+# Hausman test.
+hausman5.1F_ps <- phtest(plm5.1pFs_f, plm5.1pFs_r)
+hausman5.1F_ps # Shouldn't use random.
+
+htmlreg(list(plm5.1ps_p, plm5.1ps_b, plm5.1ps_f, plm5.1ps_r,
+             plm5.1pMs_p, plm5.1pMs_b, plm5.1pMs_f, plm5.1pMs_r,
+             plm5.1pFs_p, plm5.1pFs_b, plm5.1pFs_f, plm5.1pFs_r),
+        file = "income_combined_plm51_ukhls_ipt.html",
+        title = "UKHLS Income: Pooled, Between, Fixed, and Random Effects Models",
+        caption = "UKHLS Income: Propensity Score Matched Models",
+        caption.above = TRUE,
+        label = "tab:income_combined_plm51_ukhls",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("disp_inc_lag1" = "Disposable Income (Lag 1)",
+                               "disp_inc_lag2" = "Disposable Income (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+
+```
+
+#### 5.1.3: IPT weighted.
+
+```{r}
+
+# Pooling.
+plm5.1ipt_p <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm5.1ipt_p)
+
+# Between.
+plm5.1ipt_b <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm5.1ipt_b)
+
+# Fixed.
+plm5.1ipt_f <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm5.1ipt_f)
+
+# Random.
+plm5.1ipt_r <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm5.1ipt_r)
+
+# Hausman test.
+hausman5.1_ipt <- phtest(plm5.1ipt_f, plm5.1ipt_r)
+hausman5.1_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm5.1ipt_p, plm5.1ipt_b, plm5.1ipt_f, plm5.1ipt_r,
+          type = "html",
+          out = "income513.html",
+          title = "UKHLS income: propensity score matched pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm5.1ipt_pM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm5.1ipt_pM)
+
+# Between.
+plm5.1ipt_bM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm5.1ipt_bM)
+
+# Fixed.
+plm5.1ipt_fM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm5.1ipt_fM)
+
+# Random.
+plm5.1ipt_rM <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm5.1ipt_rM)
+
+# Hausman test.
+hausman5.1M_ipt <- phtest(plm5.1ipt_fM, plm5.1ipt_rM)
+hausman5.1M_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm5.1ipt_pM, plm5.1ipt_bM, plm5.1ipt_fM, plm5.1ipt_rM,
+          type = "html",
+          out = "income513M.html",
+          title = "UKHLS income: propensity score matched pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm5.1ipt_pF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm5.1ipt_pF)
+
+# Between.
+plm5.1ipt_bF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm5.1ipt_bF)
+
+# Fixed.
+plm5.1ipt_fF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm5.1ipt_fF)
+
+# Random.
+plm5.1ipt_rF <- plm(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm5.1ipt_rF)
+
+# Hausman test.
+hausman5.1F_ipt <- phtest(plm5.1ipt_fF, plm5.1ipt_rF)
+hausman5.1F_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm5.1ipt_pF, plm5.1ipt_bF, plm5.1ipt_fF, plm5.1ipt_rF,
+          type = "html",
+          out = "income513F.html",
+          title = "UKHLS income: propensity score matched pooled, between, fixed, and random effects, females",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+htmlreg(list(plm5.1ipt_p, plm5.1ipt_b, plm5.1ipt_f, plm5.1ipt_r,
+             plm5.1ipt_pM, plm5.1ipt_bM, plm5.1ipt_fM, plm5.1ipt_rM,
+             plm5.1ipt_pF, plm5.1ipt_bF, plm5.1ipt_fF, plm5.1ipt_rF),
+        file = "income_combined_plm51_ukhls_ipt.html",
+        title = "UKHLS Income: Pooled, Between, Fixed, and Random Effects Models",
+        caption = "UKHLS Income: Pooled, Between, Fixed, and Random Effects Models, IPT Weighted",
+        caption.above = TRUE,
+        label = "tab:income_combined_plm51_ukhls",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("disp_inc_lag1" = "Disposable Income (Lag 1)",
+                               "disp_inc_lag2" = "Disposable Income (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+```
+
+### 5.2: Random effects w/ varying slopes.
+
+#### 5.2.1: Regular
+
+```{r}
+
+# Random.
+plm5.2r <- lmer(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 + sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled + married + immigrant + (1 + sexor_binary_2 | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm5.2r) # Model fit isn't great.
+
+r_sq_plm5.2r <- r.squaredGLMM(plm5.2r) # R-squared for the whole model is very high.
+
+```
+
+##### Men.
+
+```{r}
+
+# Random.
+plm5.2rM <- lmer(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 + q_man + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_man | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm5.2rM) # Model fit isn't great.
+
+r_sq_plm5.2rM <- r.squaredGLMM(plm5.2rM) # R-squared for the whole model is very high.
+
+```
+
+##### Women.
+
+```{r}
+
+# Random.
+plm5.2rF <- lmer(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 + q_woman + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_woman | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm5.2rF) # Model fit isn't great.
+
+r_sq_plm5.2rF <- r.squaredGLMM(plm5.2rF) # R-squared for the whole model is very high.
+
+
+```
+
+#### 5.2.2: IPT weighted
+
+```{r}
+
+# Random.
+plm5.2ipt_r <- lmer(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled + married + immigrant + (1 + sexor_binary_2 | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm5.2ipt_r) # Model fit isn't great.
+
+r_sq_plm5.2ipt_r <- r.squaredGLMM(plm5.2ipt_r) # R-squared for the whole model is very high.
+r_sq_plm5.2ipt_r
+
+# Random effects.
+stargazer(plm5.2r, plm5.2ipt_r,
+          type = "html",
+          out = "income522.html",
+          title = "UKHLS Random effects w/ varying slopes",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          add.lines = list(
+            c("Marginal R-squared (R2m)", round(r_sq_plm5.2r[1], 3), round(r_sq_plm5.2ipt_r[1], 3)),
+            c("Conditional R-squared (R2c)", round(r_sq_plm5.2r[2], 3), round(r_sq_plm5.2ipt_r[2], 3))
+          ),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Random.
+plm5.2ipt_rM <- lmer(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_man + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_man | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm5.2ipt_rM) # Model fit isn't great.
+
+r_sq_plm5.2ipt_rM <- r.squaredGLMM(plm5.2ipt_rM) # R-squared for the whole model is very high.
+r_sq_plm5.2ipt_rM
+
+```
+
+##### Women.
+
+```{r}
+
+# Random.
+plm5.2ipt_rF <- lmer(disp_inc ~ disp_inc_lag1 + disp_inc_lag2 +q_woman + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_woman | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm5.2ipt_rF) # Model fit isn't great.
+
+r_sq_plm5.2ipt_rF <- r.squaredGLMM(plm5.2ipt_rF) # R-squared for the whole model is very high.
+r_sq_plm5.2ipt_rF
+
+htmlreg(list(plm5.2r, plm5.2rM, plm5.2rF,
+             plm5.2ipt_r, plm5.2ipt_rM, plm5.2ipt_rF),
+        file = "ukhls_income_LMMs.html",
+        title = "ukhls Income: Random Effects Models",
+        caption = "UKHLS Income: Linear Mixed Effects Models",
+        caption.above = TRUE,
+        label = "tab:ukhls_income_LMMs",
+        custom.model.names = c("Random", "Random (M)", "Random (F)",
+                               "Random (IPT)", "Random (IPT, M)", "Random (IPT, F)"),
+        custom.coef.map = list("disp_inc_lag1" = "Disposable Income (Lag 1)",
+                               "disp_inc_lag2" = "Disposable Income (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "hgage" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "helth" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"),
+        include.aic = TRUE,
+        include.bic = TRUE,
+        include.nobs = TRUE,
+        include.rsquared = FALSE,
+        include.adjrs = FALSE,
+        single.row = TRUE,
+        stars = c(0.01, 0.05, 0.1),
+        custom.coef.omit = c("(Intercept)", "Num. groups: hidp", "Num. groups: pidp",
+                             "Var: hidp (Intercept)", "Var: pidp (Intercept)",
+                             "Var: pidp sexor_binary_2", "Cov: pidp (Intercept) sexor_binary_2",
+                             "Var: Residual", "Var: pidp q_man", "Cov: pidp (Intercept) q_man",
+                             "Var: pidp q_woman", "Cov: pidp (Intercept) q_woman"),
+        custom.gof.rows = list(
+          R2m = c(r_sq_plm5.2r[1], r_sq_plm5.2rM[1], r_sq_plm5.2rF[1],
+                  r_sq_plm5.2ipt_r[1], r_sq_plm5.2ipt_rM[1], r_sq_plm5.2ipt_rF[1]),
+          R2c = c(r_sq_plm5.2r[2], r_sq_plm5.2rM[2], r_sq_plm5.2rF[2],
+                  r_sq_plm5.2ipt_r[2], r_sq_plm5.2ipt_rM[2], r_sq_plm5.2ipt_rF[2])
+        )
+)
+
+```
+
+### 5.3: MBAW MLE.
+
+```{r}
+
+# In Stata.
+
+```
+
+### 5.4: DML for CI.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLi <- ukhls %>%
+  select(disp_inc, disp_inc_lag1, disp_inc_lag2, sexor_binary_2, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLi <- as.data.table(UKHLS_DMLi)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLi$buno_dv <- as_factor(UKHLS_DMLi$buno_dv)
+UKHLS_DMLi$age_dv <- as_numeric(as_factor(UKHLS_DMLi$age_dv))
+str(UKHLS_DMLi$buno_dv)
+str(UKHLS_DMLi$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1i <- "disp_inc"
+treatment1i <- "sexor_binary_2"
+covars1i <- setdiff(names(UKHLS_DMLi), c("pidp", "wave", outcome1i, treatment1i))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_e <- DoubleMLData$new(UKHLS_DMLi, y_col = outcome1i, d_cols = treatment1i, x_cols = covars1i)
+
+# Fitting the DML model.
+learner1i = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1i = DoubleMLPLR$new(UKHLS_DMLobj_e, ml_l = learner1i, ml_m = learner1i)
+
+dml_plr1i$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1i = dml_plr1i$coef
+theta_hat1i
+
+# Get the standard error and confidence intervals
+se_hat1i = dml_plr1i$se
+se_hat1i 
+
+# Does seem to be causal effect of being LGB on income spells!
+
+```
+
+##### Men.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLiM <- ukhls %>%
+  select(disp_inc, disp_inc_lag1, disp_inc_lag2, q_man, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLiM <- as.data.table(UKHLS_DMLiM)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLiM$buno_dv <- as_factor(UKHLS_DMLiM$buno_dv)
+UKHLS_DMLiM$age_dv <- as_numeric(as_factor(UKHLS_DMLiM$age_dv))
+str(UKHLS_DMLiM$buno_dv)
+str(UKHLS_DMLiM$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1i <- "disp_inc"
+treatment1i <- "q_man"
+covars1i <- setdiff(names(UKHLS_DMLiM), c("pidp", "wave", outcome1i, treatment1i))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_e <- DoubleMLData$new(UKHLS_DMLiM, y_col = outcome1i, d_cols = treatment1i, x_cols = covars1i)
+
+# Fitting the DML model.
+learner1i = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1iM = DoubleMLPLR$new(UKHLS_DMLobj_e, ml_l = learner1i, ml_m = learner1i)
+
+dml_plr1iM$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1iM = dml_plr1iM$coef
+theta_hat1iM
+
+# Get the standard error and confidence intervals
+se_hat1iM = dml_plr1iM$se
+se_hat1iM 
+
+# Does seem to be causal effect of being LGB on income spells!
+
+```
+
+##### Women.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLiF <- ukhls %>%
+  select(disp_inc, disp_inc_lag1, disp_inc_lag2, q_woman, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLiF <- as.data.table(UKHLS_DMLiF)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLiF$buno_dv <- as_factor(UKHLS_DMLiF$buno_dv)
+UKHLS_DMLiF$age_dv <- as_numeric(as_factor(UKHLS_DMLiF$age_dv))
+str(UKHLS_DMLiF$buno_dv)
+str(UKHLS_DMLiF$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1i <- "disp_inc"
+treatment1i <- "q_woman"
+covars1i <- setdiff(names(UKHLS_DMLiF), c("pidp", "wave", outcome1i, treatment1i))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_e <- DoubleMLData$new(UKHLS_DMLiF, y_col = outcome1i, d_cols = treatment1i, x_cols = covars1i)
+
+# Fitting the DML model.
+learner1i = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1iF = DoubleMLPLR$new(UKHLS_DMLobj_e, ml_l = learner1i, ml_m = learner1i)
+
+dml_plr1iF$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1iF = dml_plr1iF$coef
+theta_hat1iF
+
+# Get the standard error and confidence intervals
+se_hat1iF = dml_plr1iF$se
+se_hat1iF 
+
+# Does seem to be causal effect of being LGB on income spells!
+
+```
+
+## 6: Poverty.
+
+### 6.1: Pooled, between, fixed, and random effects.
+
+#### 6.1.1: Regular.
+
+```{r}
+
+# Pooling.
+plm6.1p <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 + sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm6.1p)
+
+# Between.
+plm6.1b <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm6.1b)
+
+# Fixed.
+plm6.1f <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm6.1f)
+
+# Random.
+plm6.1r <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm6.1r)
+
+# Hausman test.
+hausman6.1 <- phtest(plm6.1f, plm6.1r)
+hausman6.1 # Shouldn't use random.
+
+# poverty: pooled, between, fixed, and random effects.
+stargazer(plm6.1p, plm6.1b, plm6.1f, plm6.1r,
+          type = "html",
+          out = "poverty611.html",
+          title = "UKHLS poverty: pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm6.1pM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 + q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm6.1pM)
+
+# Between.
+plm6.1bM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm6.1bM)
+
+# Fixed.
+plm6.1fM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm6.1fM)
+
+# Random.
+plm6.1rM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm6.1rM)
+
+# Hausman test.
+hausman6.1M <- phtest(plm6.1fM, plm6.1rM)
+hausman6.1M # Shouldn't use random.
+
+# poverty: pooled, between, fixed, and random effects.
+stargazer(plm6.1pM, plm6.1bM, plm6.1fM, plm6.1rM,
+          type = "html",
+          out = "poverty611M.html",
+          title = "UKHLS poverty: pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm6.1pF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 + q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling")
+summary(plm6.1pF)
+
+# Between.
+plm6.1bF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm6.1bF)
+
+# Fixed.
+plm6.1fF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = indinub_lw)
+summary(plm6.1fF)
+
+# Random.
+plm6.1rF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = indinub_lw)
+summary(plm6.1rF)
+
+# Hausman test.
+hausman6.1F <- phtest(plm6.1fF, plm6.1rF)
+hausman6.1F # Shouldn't use random.
+
+# poverty: pooled, between, fixed, and random effects.
+stargazer(plm6.1pF, plm6.1bF, plm6.1fF, plm6.1rF,
+          type = "html",
+          out = "poverty611F.html",
+          title = "UKHLS poverty: pooled, between, fixed, and random effects, females",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+# Install and load the htmlreg package
+# install.packages("htmlreg")
+library(htmlreg)
+
+# Combine models for all sexes, male, and female
+htmlreg(list(plm6.1p, plm6.1b, plm6.1f, plm6.1r,
+             plm6.1pM, plm6.1bM, plm6.1fM, plm6.1rM,
+             plm6.1pF, plm6.1bF, plm6.1fF, plm6.1rF),
+        file = "poverty_combined_plm61_ukhls.html",
+        title = "UKHLS Poverty: Pooled, Between, Fixed, and Random Effects Models",
+        caption = "UKHLS Poverty: Pooled, Between, Fixed, and Random Effects Models",
+        caption.above = TRUE,
+        label = "tab:poverty_combined_plm61_ukhls",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("in_poverty_lag1" = "In Poverty (Lag 1)",
+                               "in_poverty_lag2" = "In Poverty (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+
+```
+
+#### 6.1.2: PS matched.
+
+```{r}
+
+# Pooling.
+plm6.1ps_p <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm6.1ps_p)
+
+# Between.
+plm6.1ps_b <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm6.1ps_b)
+
+# Fixed.
+plm6.1ps_f <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm6.1ps_f)
+
+# Random.
+plm6.1ps_r <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm6.1ps_r)
+
+# Hausman test.
+hausman6.1_ps <- phtest(plm6.1ps_f, plm6.1ps_r)
+hausman6.1_ps # Shouldn't use random.
+
+# PS matched: pooled, between, fixed, and random effects.
+stargazer(plm6.1ps_p, plm6.1ps_b, plm6.1ps_f, plm6.1ps_r,
+          type = "html",
+          out = "poverty612.html",
+          title = "UKHLS poverty: propensity score matched pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm6.1pMs_p <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm6.1pMs_p)
+
+# Between.
+plm6.1pMs_b <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm6.1pMs_b)
+
+# Fixed.
+plm6.1pMs_f <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm6.1pMs_f)
+
+# Random.
+plm6.1pMs_r <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm6.1pMs_r)
+
+# Hausman test.
+hausman6.1M_ps <- phtest(plm6.1pMs_f, plm6.1pMs_r)
+hausman6.1M_ps # Shouldn't use random.
+
+# PS matched: pooled, between, fixed, and random effects.
+stargazer(plm6.1pMs_p, plm6.1pMs_b, plm6.1pMs_f, plm6.1pMs_r,
+          type = "html",
+          out = "poverty612M.html",
+          title = "UKHLS poverty: propensity score matched pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm6.1pFs_p <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "pooling")
+summary(plm6.1pFs_p)
+
+# Between.
+plm6.1pFs_b <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "between")
+summary(plm6.1pFs_b)
+
+# Fixed.
+plm6.1pFs_f <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ps_matches, model = "within", weights = indinub_lw)
+summary(plm6.1pFs_f)
+
+# Random.
+plm6.1pFs_r <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ps_matches, model = "random", weights = indinub_lw)
+summary(plm6.1pFs_r)
+
+# Hausman test.
+hausman6.1F_ps <- phtest(plm6.1pFs_f, plm6.1pFs_r)
+hausman6.1F_ps # Shouldn't use random.
+
+# PS matched: pooled, between, fixed, and random effects.
+htmlreg(list(plm6.1ps_p, plm6.1ps_b, plm6.1ps_f, plm6.1ps_r,
+             plm6.1pMs_p, plm6.1pMs_b, plm6.1pMs_f, plm6.1pMs_r,
+             plm6.1pFs_p, plm6.1pFs_b, plm6.1pFs_f, plm6.1pFs_r),
+        file = "income_combined_plm51_ukhls_ipt.html",
+        title = "UKHLS Poverty: Pooled, Between, Fixed, and Random Effects Models",
+        caption = "UKHLS Poverty: Propensity Score Matched Models",
+        caption.above = TRUE,
+        label = "tab:income_combined_plm51_ukhls",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("in_poverty_lag1" = "In poverty (Lag 1)",
+                               "in_poverty_lag2" = "In poverty (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+```
+
+#### 6.1.3: IPT weighted.
+
+```{r}
+
+# Pooling.
+plm6.1ipt_p <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm6.1ipt_p)
+
+# Between.
+plm6.1ipt_b <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm6.1ipt_b)
+
+# Fixed.
+plm6.1ipt_f <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm6.1ipt_f)
+
+# Random.
+plm6.1ipt_r <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm6.1ipt_r)
+
+# Hausman test.
+hausman6.1_ipt <- phtest(plm6.1ipt_f, plm6.1ipt_r)
+hausman6.1_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm6.1ipt_p, plm6.1ipt_b, plm6.1ipt_f, plm6.1ipt_r,
+          type = "html",
+          out = "poverty613.html",
+          title = "UKHLS poverty: propensity score matched pooled, between, fixed, and random effects",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Men.
+
+```{r}
+
+# Pooling.
+plm6.1ipt_pM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm6.1ipt_pM)
+
+# Between.
+plm6.1ipt_bM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm6.1ipt_bM)
+
+# Fixed.
+plm6.1ipt_fM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm6.1ipt_fM)
+
+# Random.
+plm6.1ipt_rM <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm6.1ipt_rM)
+
+# Hausman test.
+hausman6.1M_ipt <- phtest(plm6.1ipt_fM, plm6.1ipt_rM)
+hausman6.1M_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm6.1ipt_pM, plm6.1ipt_bM, plm6.1ipt_fM, plm6.1ipt_rM,
+          type = "html",
+          out = "poverty613M.html",
+          title = "UKHLS poverty: propensity score matched pooled, between, fixed, and random effects, males",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+```
+
+##### Women.
+
+```{r}
+
+# Pooling.
+plm6.1ipt_pF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "pooling", weights = final_ipt_weights)
+summary(plm6.1ipt_pF)
+
+# Between.
+plm6.1ipt_bF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "between")
+summary(plm6.1ipt_bF)
+
+# Fixed.
+plm6.1ipt_fF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married, data = ukhls, model = "within", weights = final_ipt_weights)
+summary(plm6.1ipt_fF)
+
+# Random.
+plm6.1ipt_rF <- plm(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled  + married + immigrant + is_white, data = ukhls, model = "random", weights = final_ipt_weights)
+summary(plm6.1ipt_rF)
+
+# Hausman test.
+hausman6.1F_ipt <- phtest(plm6.1ipt_fF, plm6.1ipt_rF)
+hausman6.1F_ipt # Shouldn't use random.
+
+# IPT weighted: pooled, between, fixed, and random effects.
+stargazer(plm6.1ipt_pF, plm6.1ipt_bF, plm6.1ipt_fF, plm6.1ipt_rF,
+          type = "html",
+          out = "poverty613F.html",
+          title = "UKHLS poverty: propensity score matched pooled, between, fixed, and random effects, females",
+          align = TRUE,
+          keep.stat = c("n", "rsq", "adj.rsq"),
+          no.space = TRUE)
+
+htmlreg(list(plm6.1ipt_p, plm6.1ipt_b, plm6.1ipt_f, plm6.1ipt_r,
+             plm6.1ipt_pM, plm6.1ipt_bM, plm6.1ipt_fM, plm6.1ipt_rM,
+             plm6.1ipt_pF, plm6.1ipt_bF, plm6.1ipt_fF, plm6.1ipt_rF),
+        file = "poverty_combined_plm61_ukhls_ipt.html",
+        title = "UKHLS Poverty: Pooled, Between, Fixed, and Random Effects Models, IPT Weighted",
+        caption = "UKHLS Poverty: Pooled, Between, Fixed, and Random Effects Models, IPT Weighted",
+        caption.above = TRUE,
+        label = "tab:poverty_combined_plm61_ukhls",
+        custom.model.names = c("Pooled", "Between", "Fixed", "Random",
+                               "Pooled (M)", "Between (M)", "Fixed (M)", "Random (M)",
+                               "Pooled (F)", "Between (F)", "Fixed (F)", "Random (F)"),
+        custom.coef.map = list("in_poverty_lag1" = "In Poverty (Lag 1)",
+                               "in_poverty_lag2" = "In Poverty (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "age_dv" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "disabled" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "is_white" = "White",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"))
+
+```
+
+### 6.2: Random effects w/ varying slopes.
+
+#### 6.2.1: Regular
+
+```{r}
+
+# Random.
+plm6.2r <- lmer(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 + sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled + married + immigrant + (1 + sexor_binary_2 | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm6.2r) # Model fit isn't great.
+
+r_sq_plm6.2r <- r.squaredGLMM(plm6.2r) # R-squared for the whole model is very high.
+
+```
+
+##### Men.
+
+```{r}
+
+# Random.
+plm6.2rM <- lmer(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 + q_man + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_man | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm6.2rM) # Model fit isn't great.
+
+r_sq_plm6.2rM <- r.squaredGLMM(plm6.2rM) # R-squared for the whole model is very high.
+
+```
+
+##### Women.
+
+```{r}
+
+# Random.
+plm6.2rF <- lmer(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 + q_woman + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_woman | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = indinub_lw)
+summary(plm6.2rF) # Model fit isn't great.
+
+r_sq_plm6.2rF <- r.squaredGLMM(plm6.2rF) # R-squared for the whole model is very high.
+
+
+```
+
+#### 6.2.2: IPT weighted
+
+```{r}
+
+# Random.
+plm6.2ipt_r <- lmer(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +sexor_binary_2 + age_dv + female + ed_degree + any_children + disabled + married + immigrant + (1 + sexor_binary_2 | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm6.2ipt_r) # Model fit isn't great.
+
+r_sq_plm6.2ipt_r <- r.squaredGLMM(plm6.2ipt_r) # R-squared for the whole model is very high.
+r_sq_plm6.2ipt_r
+
+```
+
+##### Men.
+
+```{r}
+
+# Random.
+plm6.2ipt_rM <- lmer(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_man + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_man | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm6.2ipt_rM) # Model fit isn't great.
+
+r_sq_plm6.2ipt_rM <- r.squaredGLMM(plm6.2ipt_rM) # R-squared for the whole model is very high.
+r_sq_plm6.2ipt_rM
+
+```
+
+##### Women.
+
+```{r}
+
+# Random.
+plm6.2ipt_rF <- lmer(in_poverty ~ in_poverty_lag1 + in_poverty_lag2 +q_woman + age_dv + ed_degree + any_children + disabled + married + immigrant + (1 + q_woman | pidp) + (1 | hidp), data = ukhls, REML = TRUE, weights = final_ipt_weights)
+summary(plm6.2ipt_rF) # Model fit isn't great.
+
+r_sq_plm6.2ipt_rF <- r.squaredGLMM(plm6.2ipt_rF) # R-squared for the whole model is very high.
+r_sq_plm6.2ipt_rF
+
+# Random effects.
+htmlreg(list(plm6.2r, plm6.2rM, plm6.2rF,
+             plm6.2ipt_r, plm6.2ipt_rM, plm6.2ipt_rF),
+        file = "ukhls_poverty_LMMs.html",
+        title = "ukhls Poverty: Random Effects Models",
+        caption = "UKHLS Poverty: Linear Mixed Effects Models",
+        caption.above = TRUE,
+        label = "tab:ukhls_poverty_LMMs",
+        custom.model.names = c("Random", "Random (M)", "Random (F)",
+                               "Random (IPT)", "Random (IPT, M)", "Random (IPT, F)"),
+        custom.coef.map = list("in_poverty_lag1" = "Poverty (Lag 1)",
+                               "in_poverty_lag2" = "Poverty (Lag 2)",
+                               "sexor_binary_2" = "Sexual Orientation (Binary)",
+                               "hgage" = "Age",
+                               "female" = "Female",
+                               "ed_degree" = "Education Degree",
+                               "any_children" = "Any Children",
+                               "helth" = "Disabled",
+                               "married" = "Married",
+                               "immigrant" = "Immigrant",
+                               "q_man" = "Gay or bisexual man",
+                               "q_woman" = "Lesbian or bisexual woman"),
+        include.aic = TRUE,
+        include.bic = TRUE,
+        include.nobs = TRUE,
+        include.rsquared = FALSE,
+        include.adjrs = FALSE,
+        single.row = TRUE,
+        stars = c(0.01, 0.05, 0.1),
+        custom.coef.omit = c("(Intercept)", "Num. groups: hidp", "Num. groups: pidp",
+                             "Var: hidp (Intercept)", "Var: pidp (Intercept)",
+                             "Var: pidp sexor_binary_2", "Cov: pidp (Intercept) sexor_binary_2",
+                             "Var: Residual", "Var: pidp q_man", "Cov: pidp (Intercept) q_man",
+                             "Var: pidp q_woman", "Cov: pidp (Intercept) q_woman"),
+        custom.gof.rows = list(
+          R2m = c(r_sq_plm6.2r[1], r_sq_plm6.2rM[1], r_sq_plm6.2rF[1],
+                  r_sq_plm6.2ipt_r[1], r_sq_plm6.2ipt_rM[1], r_sq_plm6.2ipt_rF[1]),
+          R2c = c(r_sq_plm6.2r[2], r_sq_plm6.2rM[2], r_sq_plm6.2rF[2],
+                  r_sq_plm6.2ipt_r[2], r_sq_plm6.2ipt_rM[2], r_sq_plm6.2ipt_rF[2])
+        )
+)
+
+```
+
+### 6.3: MBAW MLE.
+
+```{r}
+
+# In Stata.
+
+```
+
+### 6.4: DML for CI.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLp <- ukhls %>%
+  select(in_poverty, in_poverty_lag1, in_poverty_lag2, sexor_binary_2, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLp <- as.data.table(UKHLS_DMLp)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLp$buno_dv <- as_factor(UKHLS_DMLp$buno_dv)
+UKHLS_DMLp$age_dv <- as_numeric(as_factor(UKHLS_DMLp$age_dv))
+str(UKHLS_DMLp$buno_dv)
+str(UKHLS_DMLp$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1p <- "in_poverty"
+treatment1p <- "sexor_binary_2"
+covars1p <- setdiff(names(UKHLS_DMLp), c("pidp", "wave", outcome1p, treatment1p))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_p <- DoubleMLData$new(UKHLS_DMLp, y_col = outcome1p, d_cols = treatment1p, x_cols = covars1p)
+
+# Fitting the DML model.
+learner1p = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1p = DoubleMLPLR$new(UKHLS_DMLobj_p, ml_l = learner1p, ml_m = learner1p)
+
+dml_plr1p$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1p = dml_plr1p$coef
+theta_hat1p
+
+# Get the standard error and confidence intervals
+se_hat1p = dml_plr1p$se
+se_hat1p 
+
+# Does seem to be causal effect of being LGB on poverty spells!
+
+```
+
+##### Men.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLpM <- ukhls %>%
+  select(in_poverty, in_poverty_lag1, in_poverty_lag2, q_man, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLpM <- as.data.table(UKHLS_DMLpM)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLpM$buno_dv <- as_factor(UKHLS_DMLpM$buno_dv)
+UKHLS_DMLpM$age_dv <- as_numeric(as_factor(UKHLS_DMLpM$age_dv))
+str(UKHLS_DMLpM$buno_dv)
+str(UKHLS_DMLpM$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1p <- "in_poverty"
+treatment1p <- "q_man"
+covars1p <- setdiff(names(UKHLS_DMLpM), c("pidp", "wave", outcome1p, treatment1p))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_p <- DoubleMLData$new(UKHLS_DMLpM, y_col = outcome1p, d_cols = treatment1p, x_cols = covars1p)
+
+# Fitting the DML model.
+learner1p = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1pM = DoubleMLPLR$new(UKHLS_DMLobj_p, ml_l = learner1p, ml_m = learner1p)
+
+dml_plr1pM$fit()
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1pM = dml_plr1pM$coef
+theta_hat1pM
+
+# Get the standard error and confidence intervals
+se_hat1pM = dml_plr1pM$se
+se_hat1pM 
+
+# Create a list to store the variables
+results_list <- list(
+  se_hat1e = se_hat1e,
+  se_hat1eF = se_hat1eF,
+  se_hat1eM = se_hat1eM,
+  se_hat1i = se_hat1i,
+  se_hat1iF = se_hat1iF,
+  se_hat1iM = se_hat1iM,
+  se_hat1p = se_hat1p,
+  se_hat1pM = se_hat1pM,
+  theta_hat1e = theta_hat1e,
+  theta_hat1eF = theta_hat1eF,
+  theta_hat1eM = theta_hat1eM,
+  theta_hat1i = theta_hat1i,
+  theta_hat1iF = theta_hat1iF,
+  theta_hat1iM = theta_hat1iM,
+  theta_hat1p = theta_hat1p,
+  theta_hat1pM = theta_hat1pM
+)
+
+# Create a list of the objects with active bindings
+obj_list <- list(
+  dml_plr1e = dml_plr1e,
+  dml_plr1eF = dml_plr1eF,
+  dml_plr1eM = dml_plr1eM,
+  dml_plr1i = dml_plr1i,
+  dml_plr1iF = dml_plr1iF,
+  dml_plr1iM = dml_plr1iM,
+  dml_plr1p = dml_plr1p,
+  dml_plr1pF = dml_plr1pF,
+  dml_plr1pM = dml_plr1pM
+)
+
+# Save the list of objects to a file
+save(obj_list, file = "obj_list.RData")
+
+load("obj_list.RData")
+View(obj_list)
+
+# Save the list to a file
+save(results_list, file = "results_list.RData")
+
+load("results_list.RData")
+View(results_list)
+
+# Does seem to be causal effect of being LGB on poverty spells!
+
+```
+
+##### Women.
+
+```{r}
+
+# Creating data table.
+UKHLS_DMLpF <- ukhls %>%
+  select(in_poverty, in_poverty_lag1, in_poverty_lag2, q_woman, age_dv, female, ed_degree, any_children, disabled, urban, married, immigrant, hidp, buno_dv, wave, pidp) %>% drop_na()
+
+UKHLS_DMLpF <- as.data.table(UKHLS_DMLpF)
+
+# Making buno_dv a factor and age_dv numeric.
+UKHLS_DMLpF$buno_dv <- as_factor(UKHLS_DMLpF$buno_dv)
+UKHLS_DMLpF$age_dv <- as_numeric(as_factor(UKHLS_DMLpF$age_dv))
+str(UKHLS_DMLpF$buno_dv)
+str(UKHLS_DMLpF$age_dv)
+
+# Identifying outcome variable, treatment variable, and other covariates.
+outcome1p <- "in_poverty"
+treatment1p <- "q_woman"
+covars1p <- setdiff(names(UKHLS_DMLpF), c("pidp", "wave", outcome1p, treatment1p))
+
+# Creating DoubleMLData object.
+UKHLS_DMLobj_p <- DoubleMLData$new(UKHLS_DMLpF, y_col = outcome1p, d_cols = treatment1p, x_cols = covars1p)
+
+# Fitting the DML model.
+learner1p = lrn("regr.ranger", num.trees = 500)
+
+# Creating DoubleMLPLR object
+dml_plr1pF = DoubleMLPLR$new(UKHLS_DMLobj_p, ml_l = learner1p, ml_m = learner1p)
+
+dml_plr1pF$fit()
+
+[left off here] 
+
+# Interpretation:
+# Get the estimated treatment effect
+theta_hat1pF = dml_plr1pF$coef
+theta_hat1pF
+
+# Get the standard error and confidence intervals
+se_hat1pF = dml_plr1pF$se
+se_hat1pF 
+
+# Does seem to be causal effect of being LGB on poverty spells!
+
+```
+
+### 6.4.1 Presenting DML results.
+
+All.
+
+```{r}
+
+library(ggplot2)
+install.packages("ggpubr")
+library(ggplot2)
+
+# Create a data frame with the DML results
+dml_results <- data.frame(
+  Outcome = c("In poverty (y/n)", "Unemployment spells", "Income (asinh transformed)"),
+  Coefficient = c(theta_hat1p, theta_hat1e, theta_hat1i),
+  StandardError = c(se_hat1p, se_hat1e, se_hat1i)
+)
+
+# Create the table using stargazer
+stargazer(dml_results, type = "html", summary = FALSE, digit.separator = ",",
+          title = "UKHLS Double Machine Learning Results",
+          column.labels = c("Outcome", "Coefficient", "Standard Error"),
+          out = "UKHLS_dml_results_table.html")
+
+# Create a data frame with the DML results
+dml_results <- data.frame(
+  Outcome = c("Poverty", "Employment", "Income"),
+  Coefficient = c(theta_hat1p, theta_hat1e, theta_hat1i),
+  LowerCI = c(theta_hat1p - 1.96*se_hat1p, theta_hat1e - 1.96*se_hat1e, theta_hat1i - 1.96*se_hat1i),
+  UpperCI = c(theta_hat1p + 1.96*se_hat1p, theta_hat1e + 1.96*se_hat1e, theta_hat1i + 1.96*se_hat1i)
+)
+
+# Create the forest plot
+ggplot(dml_results, aes(x = Outcome, y = Coefficient, ymin = LowerCI, ymax = UpperCI)) +
+  geom_pointrange(color = "red4", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    panel.background = element_rect(fill = "white")
+  ) +
+  labs(title = "Double Machine Learning for Causal Inference: Poverty, Income, and Employment",
+       x = "Outcome", y = "Coefficient",
+       caption = "Error bars represent 95% confidence intervals")
+
+# Save the plot as an image file
+ggsave("UKHLS_dml_results_plot.png", width = 8, height = 6, dpi = 300)
+
+```
+
+##### Men.
+
+```{r}
+
+# Create a data frame with the DML results
+dml_resultsM <- data.frame(
+  Outcome = c("In poverty (y/n)", "Unemployment spells", "Income (asinh transformed)"),
+  Coefficient = c(theta_hat1pM, theta_hat1eM, theta_hat1iM),
+  StandardError = c(se_hat1pM, se_hat1eM, se_hat1iM)
+)
+
+# Create the table using stargazer
+stargazer(dml_resultsM, type = "html", summary = FALSE, digit.separator = ",",
+          title = "UKHLS Double Machine Learning Results, Males",
+          column.labels = c("Outcome", "Coefficient", "Standard Error"),
+          out = "UKHLS_dml_resultsM_table.html")
+
+# Create a data frame with the DML results
+dml_resultsM <- data.frame(
+  Outcome = c("Poverty", "Employment", "Income"),
+  Coefficient = c(theta_hat1pM, theta_hat1eM, theta_hat1iM),
+  LowerCI = c(theta_hat1pM - 1.96*se_hat1pM, theta_hat1eM - 1.96*se_hat1eM, theta_hat1iM - 1.96*se_hat1iM),
+  UpperCI = c(theta_hat1pM + 1.96*se_hat1pM, theta_hat1eM + 1.96*se_hat1eM, theta_hat1iM + 1.96*se_hat1iM)
+)
+
+# Create the forest plot
+ggplot(dml_resultsM, aes(x = Outcome, y = Coefficient, ymin = LowerCI, ymax = UpperCI)) +
+  geom_pointrange(color = "red4", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    panel.background = element_rect(fill = "white")
+  ) +
+  labs(title = "Double Machine Learning for Causal Inference: Poverty, Income, and Employment, Males",
+       x = "Outcome", y = "Coefficient",
+       caption = "Error bars represent 95% confidence intervals")
+
+# Save the plot as an image file
+ggsave("UKHLS_dml_resultsM_plot.png", width = 8, height = 6, dpi = 300)
+
+```
+
+##### Women.
+
+```{r}
+
+# Create a data frame with the DML results
+dml_resultsF <- data.frame(
+  Outcome = c("In poverty (y/n)", "Unemployment spells", "Income (asinh transformed)"),
+  Coefficient = c(theta_hat1pF, theta_hat1eF, theta_hat1iF),
+  StandardError = c(se_hat1pF, se_hat1eF, se_hat1iF)
+)
+
+# Create the table using stargazer
+stargazer(dml_resultsF, type = "html", summary = FALSE, digit.separator = ",",
+          title = "UKHLS Double Machine Learning Results, Females",
+          column.labels = c("Outcome", "Coefficient", "Standard Error"),
+          out = "UKHLS_dml_resultsF_table.html")
+
+# Create a data frame with the DML results
+dml_resultsF <- data.frame(
+  Outcome = c("Poverty", "Employment", "Income"),
+  Coefficient = c(theta_hat1pF, theta_hat1eF, theta_hat1iF),
+  LowerCI = c(theta_hat1pF - 1.96*se_hat1pF, theta_hat1eF - 1.96*se_hat1eF, theta_hat1iF - 1.96*se_hat1iF),
+  UpperCI = c(theta_hat1pF + 1.96*se_hat1pF, theta_hat1eF + 1.96*se_hat1eF, theta_hat1iF + 1.96*se_hat1iF)
+)
+
+# Create the forest plot
+ggplot(dml_resultsF, aes(x = Outcome, y = Coefficient, ymin = LowerCI, ymax = UpperCI)) +
+  geom_pointrange(color = "red4", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(
+    plot.background = element_rect(fill = "white"),
+    panel.background = element_rect(fill = "white")
+  ) +
+  labs(title = "Double Machine Learning for Causal Inference: Poverty, Income, and Employment, Females",
+       x = "Outcome", y = "Coefficient",
+       caption = "Error bars represent 95% confidence intervals")
+
+# Save the plot as an image file
+ggsave("UKHLS_dml_resultsF_plot.png", width = 8, height = 6, dpi = 300)
+
+```
+
+### 6.4.2. Presenting results together.
+
+```{r}
+
+plot_all <- ggplot(dml_results, aes(x = Outcome, y = Coefficient, ymin = LowerCI, ymax = UpperCI)) +
+  geom_pointrange(color = "purple", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "white", color = "white"),
+        panel.background = element_rect(fill = "white", color = "white"),
+        axis.text.y = element_text(size = 10, hjust = 1)) +
+  labs(title = "All",
+       x = "Outcome", y = "Coefficient",
+       caption = "")
+
+plot_males <- ggplot(dml_resultsM, aes(x = Outcome, y = Coefficient, ymin = LowerCI, ymax = UpperCI)) +
+  geom_pointrange(color = "blue2", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "white", color = "white"),
+        panel.background = element_rect(fill = "white", color = "white"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  labs(title = "Males",
+       x = "", y = "Coefficient",
+       caption = "")
+
+plot_females <- ggplot(dml_resultsF, aes(x = Outcome, y = Coefficient, ymin = LowerCI, ymax = UpperCI)) +
+  geom_pointrange(color = "blue4", size = 0.8) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
+  coord_flip() +
+  theme_minimal() +
+  theme(plot.background = element_rect(fill = "white", color = "white"),
+        panel.background = element_rect(fill = "white", color = "white"),
+        axis.text.y = element_blank(),
+        axis.ticks.y = element_blank()) +
+  labs(title = "Females",
+       x = "", y = "Coefficient",
+       caption = "Error bars represent 95% confidence intervals")
+
+combined_plot <- ggarrange(plot_all, plot_males, plot_females,
+                           ncol = 3, nrow = 1,
+                           common.legend = TRUE, legend = "bottom")
+
+# Add an overall title with white background using theme()
+annotate_figure(combined_plot,
+                top = text_grob("UKHLS Double Machine Learning for Causal Inference: Poverty, Income, and Employment",
+                                color = "black", face = "bold", size = 14))
+
+ggsave("UKHLS_dml_results_combined_plot.png", width = 12, height = 6, dpi = 300)
+
+
+
+```
+
+## 7: Additional miscellaneous plots
+
+```{r}
+
+mean_diu_10 <- ukhls %>%
+  filter(wave == 10) %>%
+  summarize(mean_diu = mean(disp_inc_untransformed, na.rm = TRUE))
+
+mean_diu_11 <- ukhls %>%
+  filter(wave == 11)   %>%
+  summarize(mean_diu = mean(disp_inc_untransformed, na.rm = TRUE))
+
+mean_diu_10
+mean_diu_11
+
+```
+
+```{r}
+
+plot
+
+```
